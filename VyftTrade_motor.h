@@ -12,9 +12,20 @@
 //     "currency": "EUR",
 //     "priceincurrency": "1",
 //     "wallet": "0x…",          // sous-wallet VEZ (Slura) qui règle l'ordre
+//     "leverage": "4",          // effet de levier (1 par défaut)
+//     "stoploss": "0.00098",    // prix de stop (EUR) ; absent = stop automatique
 //     "orderid": "…"            // obligatoire pour cancel_order
 //   }
 // }
+//
+// Positions à effet de levier (mise sans livraison d'actif) :
+//  - execute_order ouvre une position : buy = à la hausse, sell = à la baisse ; quantity = mise en VEZ.
+//    La mise reste sur le wallet du client, aucun VEZ n'est transféré à l'ouverture.
+//  - Stop loss : la position est fermée sans perte ni gain (résultat nul).
+//  - Gain : mise × levier × variation du prix, plafonné à mise × levier × kGainCapMove,
+//    versé en VEZ par la trésorerie Vyft Trade (SDK vyfttxl_mate).
+//  - Levier maximum : VEZ disponibles en trésorerie ÷ (mise × kGainCapMove).
+//  - cancel_order clôt la position (orderid) au prix courant.
 
 #pragma once
 
@@ -34,7 +45,11 @@ inline constexpr const char* kVezAsset = "VEZ";
 inline constexpr const char* kVezName = "Vyft VEZ";
 inline constexpr const char* kVezChain = "SLU";
 inline constexpr int kVezDecimals = 6;          // plus petite unité : 0,000001 VEZ
-inline constexpr double kVezPriceEur = 1.0;     // 1 VEZ = 1 € (prix de référence)
+inline constexpr double kVezPriceEur = 1.0;     // prix de repli (le serveur lit la preuve de réserves)
+
+// Variation de prix couverte par position : le gain est plafonné à mise × levier × 50 %
+// (la position est clôturée automatiquement à ce plafond)
+inline constexpr double kGainCapMove = 0.5;
 
 enum class TradeType { Buy, Sell };
 enum class ActionType { ExecuteOrder, CancelOrder };
@@ -53,7 +68,20 @@ struct TradeAction {
     double priceInCurrency = kVezPriceEur;   // prix d'1 VEZ dans la devise
     std::string wallet;                       // adresse 0x du sous-wallet VEZ
     std::string orderId;                      // pour cancel_order
+    double leverage = 1.0;                    // effet de levier (≥ 1)
+    double stopLoss = 0.0;                    // prix de stop en EUR (0 = automatique)
 };
+
+// Position ouverte : mise (VEZ), sens, levier, prix d'entrée et de stop (EUR)
+struct Position {
+    TradeType side = TradeType::Buy;
+    double stake = 0.0;
+    double leverage = 1.0;
+    double entryPrice = 0.0;
+    double stopLoss = 0.0;
+};
+
+enum class CloseReason { None, StopLoss, TakeProfit };
 
 struct Order {
     AssetData assetData;
@@ -90,6 +118,31 @@ std::string buildOrderJson(const Order& order);
 // Valide puis envoie l'ordre (POST JSON) ; apiKey facultative (en-tête X-API-KEY)
 TradeResult sendOrder(const Order& order, const std::string& url = kTradeUrl,
                       const std::string& apiKey = "");
+
+// ── Positions à effet de levier ──
+
+// Levier maximum pour une mise, selon les VEZ disponibles en trésorerie (0 = position impossible)
+double maxLeverage(double stake, double availableVez);
+
+// Gain maximum réservé en trésorerie pour une position (VEZ)
+double maxGain(double stake, double leverage);
+
+// Stop automatique : là où une position classique aurait perdu toute sa mise
+double autoStopLoss(TradeType side, double entryPrice, double leverage);
+
+// Vérifie une position avant ouverture ; renvoie un message d'erreur ou std::nullopt
+std::optional<std::string> validatePosition(const Position& position, double availableVez);
+
+// Résultat brut au prix donné (VEZ, négatif en cas de baisse pour un long)
+double positionResult(const Position& position, double price);
+
+// Clôture automatique au prix donné : stop loss atteint, ou plafond de gain atteint
+CloseReason checkClose(const Position& position, double price);
+
+// VEZ versés au client à la clôture : 0 au stop loss ou en perte, gain plafonné sinon
+double settlementAmount(const Position& position, double price, CloseReason reason);
+
+const char* toString(CloseReason value);
 
 }  // namespace vyfttrade
 

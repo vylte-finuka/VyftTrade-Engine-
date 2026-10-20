@@ -9,7 +9,9 @@
 #include <sstream>
 
 #ifdef _WIN32
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <windows.h>
 #include <winhttp.h>
 #elif defined(VYFTTRADE_WITH_CURL)
@@ -233,7 +235,67 @@ std::optional<std::string> validateOrder(const Order& order) {
     if (!isHexAddress(a.wallet)) return std::string("Adresse de sous-wallet VEZ invalide (0x + 40 caractères)");
     if (a.actionType == ActionType::CancelOrder && a.orderId.empty())
         return std::string("Identifiant d'ordre requis pour l'annulation");
+    if (!std::isfinite(a.leverage) || a.leverage < 1) return std::string("Levier invalide (1 minimum)");
+    if (!std::isfinite(a.stopLoss) || a.stopLoss < 0) return std::string("Stop loss invalide");
     return std::nullopt;
+}
+
+double maxLeverage(double stake, double availableVez) {
+    if (!std::isfinite(stake) || stake <= 0 || !std::isfinite(availableVez) || availableVez <= 0) return 0;
+    return std::floor(availableVez / (stake * kGainCapMove));
+}
+
+double maxGain(double stake, double leverage) { return stake * leverage * kGainCapMove; }
+
+double autoStopLoss(TradeType side, double entryPrice, double leverage) {
+    return side == TradeType::Buy ? entryPrice * (1.0 - 1.0 / leverage) : entryPrice * (1.0 + 1.0 / leverage);
+}
+
+std::optional<std::string> validatePosition(const Position& p, double availableVez) {
+    if (!std::isfinite(p.stake) || p.stake <= 0) return std::string("Mise invalide");
+    if (!std::isfinite(p.entryPrice) || p.entryPrice <= 0) return std::string("Prix VEZ indisponible");
+    if (!std::isfinite(p.leverage) || p.leverage < 1) return std::string("Levier invalide (1 minimum)");
+    if (p.side == TradeType::Buy && !(p.stopLoss >= 0 && p.stopLoss < p.entryPrice))
+        return std::string("Le stop loss d'une position à la hausse doit être sous le prix d'entrée");
+    if (p.side == TradeType::Sell && !(p.stopLoss > p.entryPrice))
+        return std::string("Le stop loss d'une position à la baisse doit être au-dessus du prix d'entrée");
+    const double limit = maxLeverage(p.stake, availableVez);
+    if (limit < 1) return std::string("Offre insuffisante en trésorerie pour couvrir cette mise");
+    if (p.leverage > limit) return "Levier maximum pour cette mise : x" + formatDecimal(limit, 0);
+    return std::nullopt;
+}
+
+double positionResult(const Position& p, double price) {
+    const double move = p.side == TradeType::Buy ? price / p.entryPrice - 1.0 : 1.0 - price / p.entryPrice;
+    return p.stake * p.leverage * move;
+}
+
+CloseReason checkClose(const Position& p, double price) {
+    if (!std::isfinite(price) || price <= 0) return CloseReason::None;
+    if (p.side == TradeType::Buy) {
+        if (p.stopLoss > 0 && price <= p.stopLoss) return CloseReason::StopLoss;
+        if (price >= p.entryPrice * (1.0 + kGainCapMove)) return CloseReason::TakeProfit;
+    } else {
+        if (price >= p.stopLoss) return CloseReason::StopLoss;
+        if (price <= p.entryPrice * (1.0 - kGainCapMove)) return CloseReason::TakeProfit;
+    }
+    return CloseReason::None;
+}
+
+double settlementAmount(const Position& p, double price, CloseReason reason) {
+    if (reason == CloseReason::StopLoss) return 0;
+    const double result = positionResult(p, price);
+    if (!std::isfinite(result) || result <= 0) return 0;
+    return std::floor(std::min(result, maxGain(p.stake, p.leverage)) * std::pow(10.0, kVezDecimals)) /
+           std::pow(10.0, kVezDecimals);
+}
+
+const char* toString(CloseReason value) {
+    switch (value) {
+        case CloseReason::StopLoss: return "stop_loss";
+        case CloseReason::TakeProfit: return "take_profit";
+        default: return "manual";
+    }
 }
 
 std::string buildOrderJson(const Order& order) {
@@ -250,7 +312,9 @@ std::string buildOrderJson(const Order& order) {
          << "\"quantity\":" << jsonString(formatQuantity(a.quantity)) << ","
          << "\"currency\":" << jsonString(a.currency) << ","
          << "\"priceincurrency\":" << jsonString(formatDecimal(a.priceInCurrency, 8)) << ","
-         << "\"wallet\":" << jsonString(a.wallet);
+         << "\"wallet\":" << jsonString(a.wallet) << ","
+         << "\"leverage\":" << jsonString(formatDecimal(a.leverage, 2));
+    if (a.stopLoss > 0) json << ",\"stoploss\":" << jsonString(formatDecimal(a.stopLoss, 10));
     if (!a.orderId.empty()) json << ",\"orderid\":" << jsonString(a.orderId);
     json << "}}";
     return json.str();
