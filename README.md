@@ -86,6 +86,39 @@ avec le SDK `vyfttxl_mate` (`redeemvez`), puis déclare la transaction sur `/api
 Le serveur vérifie l'événement `vezRedeemed` (pool, destinataire, montant) avant de passer la position
 à `closed`. Un hash de transaction ne peut servir qu'à une seule position.
 
+### Marché (paires et carnet d'ordres)
+
+**Listing.** `POST /api/v1/admin/pairs` (en-tête `X-ADMIN-KEY`) liste une paire BASE/COTATION, cotée en
+VEZ par défaut. Le jeton est vérifié sur Slura et ses décimales y sont lues ; `index` (facultatif) donne
+la source du cours de référence. `DELETE /api/v1/admin/pairs/XAU-VEZ` la déliste et annule ses ordres.
+
+```json
+{ "base": { "symbol": "XAU", "name": "Or (once troy)", "token": "0x…" },
+  "index": { "url": "https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/xau.json",
+             "path": "xau.eur", "currency": "EUR" } }
+```
+
+**Un wallet par jeton.** Chaque client a un wallet VyftVEZ par actif (le bytecode du wallet du SDK avec
+l'adresse du jeton remplacée), créé par l'app. Vyft Trade ne détient ni ne bloque aucun fonds : un
+ordre est accepté si le wallet couvre, sur la chaîne, l'ordre en plus de ses ordres et échanges en cours.
+
+**Règlement, vendeur d'abord**, chaque étape étant une opération du SDK (`disburse`) vérifiée sur Slura :
+1. `awaiting_delivery` : l'app du vendeur envoie la base vers le wallet d'actif de l'acheteur, puis
+   `POST /api/v1/market/trades/<id>/delivery` `{account, op}`. Sans livraison dans le délai
+   (`VYFTTRADE_DELIVERY_SECONDS`, 600), l'échange est annulé et l'ordre d'achat retrouve sa quantité.
+2. `awaiting_payment` : l'app de l'acheteur envoie le prix moins les frais au vendeur et les frais au
+   pool, puis `POST …/payment` `{account, ops}`. Hors délai (`VYFTTRADE_PAYMENT_SECONDS`, 900), l'échange
+   passe à `payment_overdue` et l'acheteur est suspendu jusqu'à son paiement.
+3. `settled`.
+
+`GET /api/v1/market/trades?account=0x…` indique pour chaque échange l'étape que l'app du client doit
+faire, avec les destinataires et les montants exacts. Les frais (`VYFTTRADE_TRADE_FEE_PPM`, 2000 =
+0,2 %) sont à la charge du vendeur et vont au pool. Trois livraisons manquées en 24 h suspendent le vendeur.
+
+**Données de marché.** `GET /api/v1/market/tickers` et, par paire, `…/ticker`, `…/book`, `…/trades`,
+`…/candles?interval=1m|5m|15m|1h|4h|1d`. Le ticker donne le dernier prix, la variation, le volume sur
+24 h, le cours de référence, le prix de marque et le sentiment (part acheteuse et vendeuse).
+
 **Offre du pool.** Le serveur lit sur Slura le solde du pool, son plafond de versement
 (`MAX_TRANSFER_AMOUNT`), `earnRatio` et les décimales du VEZ. La part réservée au trading est fixée par
 `VYFTTRADE_POOL_SEED` (0 par défaut : trading fermé) ; les récompenses de pas n'y sont jamais prises.

@@ -1,4 +1,4 @@
-﻿# CMakeList.txt : moteur Vyft Trade™ (bibliothèque d'ordres VEZ + exécutable en ligne de commande)
+# CMakeList.txt : moteur Vyft Trade™ (bibliothèque d'ordres VEZ + exécutable en ligne de commande)
 
 # Compilable seul (Docker, cmake -S .) ou comme sous-projet du CMakeLists.txt parent
 if (CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
@@ -38,7 +38,7 @@ if (VYFTTRADE_BUILD_SERVER)
     URL https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz)
   FetchContent_MakeAvailable (httplib nlohmann_json)
 
-  add_executable (VyftTradeServer "VyftTrade_server.cpp" "VyftTrade_market.cpp")
+  add_executable (VyftTradeServer "VyftTrade_server.cpp" "VyftTrade_market.cpp" "VyftTrade_book.cpp")
   target_link_libraries (VyftTradeServer PRIVATE VyftTradeEngine httplib::httplib nlohmann_json::nlohmann_json)
   if (WIN32)
     target_link_libraries (VyftTradeServer PRIVATE ws2_32)

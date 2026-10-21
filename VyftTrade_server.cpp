@@ -11,6 +11,14 @@
 //   GET  /api/v1/market/pairs/<BASE>-<QUOTE>   une paire
 //   GET  /api/v1/market/assets                 actifs (jeton, décimales) et cours en EUR et en VEZ
 //   GET  /api/v1/market/prices                 cours de tous les actifs, VEZ compris
+//   GET  /api/v1/market/tickers                tickers de toutes les paires (sentiment compris)
+//   GET  /api/v1/market/pairs/<B>-<Q>/ticker|book|trades|candles   données d'une paire
+//   POST /api/v1/market/orders                 ordre { pair, side, type, amount, price?, account, baseWallet, quoteWallet }
+//   DELETE /api/v1/market/orders/<id>?account=  annulation
+//   GET  /api/v1/market/orders?account=0x…     ordres d'un client
+//   GET  /api/v1/market/trades?account=0x…     échanges d'un client et action à faire (livrer / payer)
+//   POST /api/v1/market/trades/<id>/delivery   { account, op } livraison du vendeur (opération SDK)
+//   POST /api/v1/market/trades/<id>/payment    { account, ops } paiement de l'acheteur (opérations SDK)
 //   POST /api/v1/admin/pairs                   listing (X-ADMIN-KEY)
 //   DELETE /api/v1/admin/pairs/<BASE>-<QUOTE>  délisting (X-ADMIN-KEY)
 //   GET  /health                               état du service
@@ -37,6 +45,7 @@
 //   leur versement net maximum. Le trading ne peut jamais engager plus que cette liquidité, ni plus que
 //   le solde réel du pool : les récompenses de pas ne servent jamais à payer un trader.
 
+#include "VyftTrade_book.h"
 #include "VyftTrade_market.h"
 #include "VyftTrade_motor.h"
 
@@ -164,6 +173,7 @@ constexpr const char* kSelSoldeVyftHealth = "0x48e6f7f0";   // soldeVyftHealth()
 constexpr const char* kSelMaxTransfer = "0xfc1b3113";       // MAX_TRANSFER_AMOUNT()
 constexpr const char* kSelEarnRatio = "0x314465d2";         // earnRatio()
 constexpr const char* kSelWalletBalance = "0x329a27e7";     // getWalletBalance() du sous-wallet VEZ
+constexpr const char* kSelDisburse = "0x26d79ce5";          // disburse(address,uint256,string)
 constexpr const char* kTopicVezRedeemed = "0x8c7c3a79ccdd78795909c9ee121301223db0f4025354bb7f4c6396f99a47b249";
 
 struct PoolInfo {
@@ -253,6 +263,52 @@ public:
         }
         error = "Aucun versement vezRedeemed du pool vers ce wallet dans cette transaction";
         return PayoutCheck::Invalid;
+    }
+
+    // Solde exact d'un wallet VyftVEZ (un jeton par wallet), en unités du jeton
+    std::optional<vyfttrade::U512> walletUnits(const std::string& wallet) {
+        auto value = call(wallet, kSelWalletBalance);
+        if (!value) return std::nullopt;
+        return vyfttrade::U512::parseHex(value->substr(0, std::min<size_t>(value->size(), 66)));
+    }
+
+    // Opération SDK (UserOperation) : disburse(to, value, clé) exécuté par le wallet `sender`
+    vyfttrade::VerifiedTransfer verifyDisburse(const std::string& userOpHash) {
+        using State = vyfttrade::VerifiedTransfer::State;
+        vyfttrade::VerifiedTransfer out;
+        auto op = rpc("eth_getUserOperationByHash", json::array({userOpHash}));
+        if (!op) {
+            out.state = State::Pending;
+            out.error = "RPC Slura injoignable";
+            return out;
+        }
+        if (op->is_null()) {
+            out.state = State::Pending;
+            out.error = "Opération inconnue ou pas encore incluse dans un bloc";
+            return out;
+        }
+        const json userOp = op->value("userOperation", json::object());
+        const std::string callData = lower(userOp.value("callData", ""));
+        out.sender = lower(userOp.value("sender", ""));
+        // disburse(address,uint256,string) : sélecteur 0x26d79ce5, destinataire et montant dans les mots 1 et 2
+        if (callData.rfind(kSelDisburse, 0) != 0 || callData.size() < 10 + 64 * 2) {
+            out.error = "Cette opération n'est pas un envoi (disburse) du wallet";
+            return out;
+        }
+        out.to = "0x" + callData.substr(10 + 24, 40);
+        out.value = vyfttrade::U512::parseHex(callData.substr(10 + 64, 64)).value_or(vyfttrade::U512());
+
+        auto receipt = rpc("eth_getUserOperationReceipt", json::array({userOpHash}));
+        if (!receipt || receipt->is_null()) {
+            out.state = State::Pending;
+            out.error = "Opération pas encore exécutée";
+            return out;
+        }
+        const json& success = receipt->contains("success") ? receipt->at("success") : json(nullptr);
+        const bool ok = success.is_boolean() ? success.get<bool>() : success == "0x1";
+        out.state = ok ? State::Ok : State::Failed;
+        if (!ok) out.error = "Envoi refusé par le wallet (solde ou clé VyftID)";
+        return out;
     }
 
     // Un contrat est-il déployé à cette adresse ? (listing d'un jeton)
@@ -559,6 +615,28 @@ int main(int argc, char** argv) {
         const auto res = vyfttrade::httpGet(url);
         return res.ok ? std::optional<std::string>(res.body) : std::nullopt;
     });
+
+    // Carnets d'ordres : à côté du fichier des positions (book.json), ou VYFTTRADE_BOOK_FILE.
+    // Frais du vendeur (VYFTTRADE_TRADE_FEE_PPM, défaut 2000 = 0,2 %) versés au pool VyftHealth.
+    vyfttrade::BookConfig bookConfig;
+    bookConfig.walletUnits = [&](const std::string& wallet) { return chain.walletUnits(wallet); };
+    bookConfig.feeRecipient = chain.pool();
+    bookConfig.feeRatePpm = std::strtoull(envOr("VYFTTRADE_TRADE_FEE_PPM", "2000").c_str(), nullptr, 10);
+    bookConfig.deliverySeconds = std::max(60, std::atoi(envOr("VYFTTRADE_DELIVERY_SECONDS", "600").c_str()));
+    bookConfig.paymentSeconds = std::max(60, std::atoi(envOr("VYFTTRADE_PAYMENT_SECONDS", "900").c_str()));
+    vyfttrade::OrderBook book(envOr("VYFTTRADE_BOOK_FILE", (dataFile.parent_path() / "book.json").string().c_str()),
+                              bookConfig);
+
+    // Cours de référence d'une paire en unités de cotation (VEZ) : source externe convertie via la preuve de réserves
+    auto indexInQuote = [&](const vyfttrade::Pair& p) -> std::optional<double> {
+        if (!p.index || p.quote.symbol != "VEZ") return std::nullopt;
+        auto value = priceBook.indexValue(*p.index);
+        if (!value) return std::nullopt;
+        if (p.index->currency == "VEZ") return value;
+        auto vezEur = chain.price();
+        if (!vezEur || *vezEur <= 0) return std::nullopt;
+        return *value / *vezEur;
+    };
     httplib::Server server;
 
     // Clé d'API (si configurée) sur toutes les routes /api
@@ -641,6 +719,138 @@ int main(int argc, char** argv) {
     server.Delete(R"(/api/v1/admin/pairs/([A-Za-z0-9]+)[-_]([A-Za-z0-9]+))", [&](const httplib::Request& req, httplib::Response& res) {
         if (!adminAllowed(req, res)) return;
         auto [status, result] = registry.delist(std::string(req.matches[1]) + "/" + std::string(req.matches[2]));
+        // Délisting : les ordres en attente sont annulés ; les échanges en cours se règlent normalement
+        if (status == 200) book.cancelPair(result.value("symbol", ""), "delisted");
+        reply(res, status, result);
+    });
+
+    // ── Carnet d'ordres ──
+    auto pairFromPath = [&](const httplib::Request& req) {
+        return registry.find(std::string(req.matches[1]) + "/" + std::string(req.matches[2]));
+    };
+    auto parseBody = [](const httplib::Request& req, json& out) {
+        try {
+            out = json::parse(req.body);
+            return out.is_object();
+        } catch (...) {
+            return false;
+        }
+    };
+
+    server.Get("/api/v1/market/tickers", [&](const httplib::Request&, httplib::Response& res) {
+        json tickers = json::array();
+        for (const auto& p : registry.pairs()) tickers.push_back(book.ticker(p, indexInQuote(p)));
+        reply(res, 200, {{"tickers", tickers}});
+    });
+
+    server.Get(R"(/api/v1/market/pairs/([A-Za-z0-9]+)[-_]([A-Za-z0-9]+)/(ticker|book|trades|candles))",
+               [&](const httplib::Request& req, httplib::Response& res) {
+        auto pair = pairFromPath(req);
+        if (!pair) {
+            reply(res, 404, {{"error", "Paire introuvable"}});
+            return;
+        }
+        const std::string what = req.matches[3];
+        if (what == "ticker") {
+            reply(res, 200, book.ticker(*pair, indexInQuote(*pair)));
+        } else if (what == "book") {
+            const size_t depth = std::clamp(std::atoi(req.get_param_value("depth").c_str()), 1, 100);
+            reply(res, 200, book.depth(*pair, req.has_param("depth") ? depth : 20));
+        } else if (what == "trades") {
+            const size_t limit = std::clamp(std::atoi(req.get_param_value("limit").c_str()), 1, 200);
+            reply(res, 200, {{"trades", book.recentTrades(*pair, req.has_param("limit") ? limit : 50)}});
+        } else {
+            static const std::map<std::string, int64_t> intervals = {{"1m", 60}, {"5m", 300}, {"15m", 900}, {"1h", 3600}, {"4h", 14400}, {"1d", 86400}};
+            const std::string interval = req.has_param("interval") ? req.get_param_value("interval") : "1h";
+            auto it = intervals.find(interval);
+            if (it == intervals.end()) {
+                reply(res, 400, {{"error", "interval : 1m, 5m, 15m, 1h, 4h ou 1d"}});
+                return;
+            }
+            const size_t limit = std::clamp(std::atoi(req.get_param_value("limit").c_str()), 1, 500);
+            reply(res, 200, {{"interval", interval}, {"candles", book.candles(*pair, it->second, req.has_param("limit") ? limit : 100)}});
+        }
+    });
+
+    // Ordre : { pair, side: buy|sell, type: limit|market, amount, price?, account, baseWallet, quoteWallet }
+    server.Post("/api/v1/market/orders", [&](const httplib::Request& req, httplib::Response& res) {
+        json body;
+        if (!parseBody(req, body)) {
+            reply(res, 400, {{"error", "Corps JSON invalide"}});
+            return;
+        }
+        auto pair = registry.find(body.value("pair", ""));
+        if (!pair) {
+            reply(res, 404, {{"error", "Paire introuvable"}});
+            return;
+        }
+        auto [status, result] = book.place(*pair, body);
+        reply(res, status, result);
+    });
+
+    server.Delete(R"(/api/v1/market/orders/([A-Za-z0-9_]+))", [&](const httplib::Request& req, httplib::Response& res) {
+        auto [status, result] = book.cancel(req.matches[1], req.get_param_value("account"));
+        reply(res, status, result);
+    });
+
+    server.Get("/api/v1/market/orders", [&](const httplib::Request& req, httplib::Response& res) {
+        const std::string account = req.get_param_value("account");
+        if (!isWallet(account)) {
+            reply(res, 400, {{"error", "Paramètre account (sous-wallet VEZ) requis"}});
+            return;
+        }
+        reply(res, 200, {{"orders", book.orders(account)}});
+    });
+
+    // Échanges du client, avec l'action que son app doit faire (livrer ou payer) et les montants exacts
+    server.Get("/api/v1/market/trades", [&](const httplib::Request& req, httplib::Response& res) {
+        const std::string account = req.get_param_value("account");
+        if (!isWallet(account)) {
+            reply(res, 400, {{"error", "Paramètre account (sous-wallet VEZ) requis"}});
+            return;
+        }
+        json out = {{"trades", book.trades(account)}};
+        if (auto reason = book.suspension(account)) out["suspended"] = *reason;
+        reply(res, 200, out);
+    });
+
+    // Livraison du vendeur : { account, op } — op = hash de l'opération SDK (disburse de la base)
+    server.Post(R"(/api/v1/market/trades/([A-Za-z0-9_]+)/delivery)", [&](const httplib::Request& req, httplib::Response& res) {
+        json body;
+        if (!parseBody(req, body)) {
+            reply(res, 400, {{"error", "Corps JSON invalide"}});
+            return;
+        }
+        const std::string op = lower(body.value("op", ""));
+        if (!isTxHash(op)) {
+            reply(res, 400, {{"error", "op : hash de l'opération SDK (0x + 64 caractères) requis"}});
+            return;
+        }
+        auto [status, result] = book.deliver(req.matches[1], body.value("account", ""), op, chain.verifyDisburse(op));
+        reply(res, status, result);
+    });
+
+    // Paiement de l'acheteur : { account, ops: [hash, …] } — prix moins frais au vendeur, frais au pool
+    server.Post(R"(/api/v1/market/trades/([A-Za-z0-9_]+)/payment)", [&](const httplib::Request& req, httplib::Response& res) {
+        json body;
+        if (!parseBody(req, body)) {
+            reply(res, 400, {{"error", "Corps JSON invalide"}});
+            return;
+        }
+        std::vector<std::pair<std::string, vyfttrade::VerifiedTransfer>> ops;
+        for (const auto& item : body.value("ops", json::array())) {
+            const std::string op = item.is_string() ? lower(item.get<std::string>()) : "";
+            if (!isTxHash(op)) {
+                reply(res, 400, {{"error", "ops : liste de hash d'opérations SDK (0x + 64 caractères)"}});
+                return;
+            }
+            ops.emplace_back(op, chain.verifyDisburse(op));
+        }
+        if (ops.empty() || ops.size() > 4) {
+            reply(res, 400, {{"error", "ops : 1 à 4 opérations"}});
+            return;
+        }
+        auto [status, result] = book.pay(req.matches[1], body.value("account", ""), ops);
         reply(res, status, result);
     });
 
@@ -840,6 +1050,7 @@ int main(int argc, char** argv) {
                     if (status == 200) closePosition(store, closing, *price, reason);
                 }
             }
+            book.expire();   // livraisons et paiements hors délai
             for (int i = 0; i < pollSeconds && running; ++i) std::this_thread::sleep_for(std::chrono::seconds(1));
         }
     });
