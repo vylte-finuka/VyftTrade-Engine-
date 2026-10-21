@@ -93,7 +93,8 @@ Le serveur vérifie l'événement `vezRedeemed` (pool, destinataire, montant) av
 | Variable | Défaut |
 |---|---|
 | `VYFTTRADE_POOL_SEED` | `0` |
-| `VYFTTRADE_POOL_ADDRESS` | `0xF7c28aBEdF73761F428a1D209a0290D8baEd2dCC` |
+| `VYFTTRADE_POOL_ADDRESS` | `0x352aBa76dDC0c4002134333417543fbb268b21a1` |
+| `VYFTTRADE_ADMIN_KEY` | aucune (administration fermée) |
 | `VYFT_RPC_URL` | `https://slu-charene.vyft-one.com` |
 | `POR_URL` | `https://por.vyft-one.com/api/mint` |
 | `VYFTTRADE_API_KEY` | aucune |

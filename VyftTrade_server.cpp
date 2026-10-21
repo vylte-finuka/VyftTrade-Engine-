@@ -7,13 +7,21 @@
 //   GET  /api/v1/trade/quote?wallet=0x…&stake=N prix, offre du pool, frais actuels, levier proposé
 //   GET  /api/v1/trade/orders?wallet=0x…       positions d'un sous-wallet VEZ (plus récentes en premier)
 //   GET  /api/v1/trade/orders/<orderid>        une position
+//   GET  /api/v1/market/pairs[?all=1]          paires listées (et délistées avec all=1)
+//   GET  /api/v1/market/pairs/<BASE>-<QUOTE>   une paire
+//   GET  /api/v1/market/assets                 actifs (jeton, décimales) et cours en EUR et en VEZ
+//   GET  /api/v1/market/prices                 cours de tous les actifs, VEZ compris
+//   POST /api/v1/admin/pairs                   listing (X-ADMIN-KEY)
+//   DELETE /api/v1/admin/pairs/<BASE>-<QUOTE>  délisting (X-ADMIN-KEY)
 //   GET  /health                               état du service
 //
 // Lancement : VyftTradeServer [port=1542] [fichier=orders.json]
 //   VYFTTRADE_API_KEY       facultatif : exige l'en-tête X-API-KEY sur /api
+//   VYFTTRADE_ADMIN_KEY     clé d'administration (listing) ; sans elle, l'administration est fermée
+//   VYFTTRADE_PAIRS_FILE    paires listées (défaut : pairs.json à côté du fichier des positions)
 //   VYFTTRADE_POLL_SECONDS  intervalle de surveillance des stop loss (défaut 15)
 //   VYFTTRADE_POOL_SEED     VEZ du pool VyftHealth alloués au trading par Vyft (défaut 0 : trading fermé)
-//   VYFTTRADE_POOL_ADDRESS  contrat VyftHealth (défaut 0xF7c28aBEdF73761F428a1D209a0290D8baEd2dCC)
+//   VYFTTRADE_POOL_ADDRESS  contrat VyftHealth (défaut 0x352aBa76dDC0c4002134333417543fbb268b21a1)
 //   VYFT_RPC_URL            RPC Slura (défaut https://slu-charene.vyft-one.com)
 //   POR_URL                 preuve de réserves (défaut https://por.vyft-one.com/api/mint)
 // Le TLS est assuré par le proxy frontal (vyft-trade.vyft-one.com → ce service en HTTP).
@@ -29,6 +37,7 @@
 //   leur versement net maximum. Le trading ne peut jamais engager plus que cette liquidité, ni plus que
 //   le solde réel du pool : les récompenses de pas ne servent jamais à payer un trader.
 
+#include "VyftTrade_market.h"
 #include "VyftTrade_motor.h"
 
 #include <httplib.h>
@@ -244,6 +253,21 @@ public:
         }
         error = "Aucun versement vezRedeemed du pool vers ce wallet dans cette transaction";
         return PayoutCheck::Invalid;
+    }
+
+    // Un contrat est-il déployé à cette adresse ? (listing d'un jeton)
+    bool hasCode(const std::string& address) {
+        auto code = rpc("eth_getCode", json::array({address, "latest"}));
+        return code && code->is_string() && code->get<std::string>().size() > 2;
+    }
+
+    // Décimales d'un jeton (decimals()) ; nullopt si illisibles
+    std::optional<int> tokenDecimals(const std::string& token) {
+        auto dec = call(token, kSelDecimals);
+        if (!dec) return std::nullopt;
+        const long double value = hexToNumber(*dec);
+        if (value < 0 || value > 36) return std::nullopt;
+        return static_cast<int>(value);
     }
 
 private:
@@ -524,7 +548,17 @@ int main(int argc, char** argv) {
     PositionStore store(dataFile, std::isfinite(poolSeed) ? poolSeed : 0);
     Chain chain(envOr("VYFT_RPC_URL", "https://slu-charene.vyft-one.com"),
                 envOr("POR_URL", "https://por.vyft-one.com/api/mint"),
-                envOr("VYFTTRADE_POOL_ADDRESS", "0xF7c28aBEdF73761F428a1D209a0290D8baEd2dCC"));
+                envOr("VYFTTRADE_POOL_ADDRESS", "0x352aBa76dDC0c4002134333417543fbb268b21a1"));
+
+    // Paires listées : à côté du fichier des positions (pairs.json), ou VYFTTRADE_PAIRS_FILE
+    const std::string adminKey = envOr("VYFTTRADE_ADMIN_KEY", "");
+    const std::filesystem::path pairsFile =
+        envOr("VYFTTRADE_PAIRS_FILE", (dataFile.parent_path() / "pairs.json").string().c_str());
+    vyfttrade::MarketRegistry registry(pairsFile);
+    vyfttrade::PriceBook priceBook([](const std::string& url) -> std::optional<std::string> {
+        const auto res = vyfttrade::httpGet(url);
+        return res.ok ? std::optional<std::string>(res.body) : std::nullopt;
+    });
     httplib::Server server;
 
     // Clé d'API (si configurée) sur toutes les routes /api
@@ -538,6 +572,76 @@ int main(int argc, char** argv) {
 
     server.Get("/health", [](const httplib::Request&, httplib::Response& res) {
         reply(res, 200, {{"status", "ok"}, {"asset", vyfttrade::kVezAsset}, {"chain", vyfttrade::kVezChain}});
+    });
+
+    // ── Marché : paires listées et cours de tous les actifs (VEZ compris) ──
+    server.Get("/api/v1/market/pairs", [&](const httplib::Request& req, httplib::Response& res) {
+        json pairs = json::array();
+        for (const auto& p : registry.pairs(req.get_param_value("all") == "1")) pairs.push_back(vyfttrade::toJson(p));
+        reply(res, 200, {{"pairs", pairs}});
+    });
+
+    server.Get(R"(/api/v1/market/pairs/([A-Za-z0-9]+)[-_]([A-Za-z0-9]+))", [&](const httplib::Request& req, httplib::Response& res) {
+        if (auto p = registry.find(std::string(req.matches[1]) + "/" + std::string(req.matches[2]))) reply(res, 200, vyfttrade::toJson(*p));
+        else reply(res, 404, {{"error", "Paire introuvable"}});
+    });
+
+    // Actifs à proposer dans l'app (jeton et décimales pour créer le wallet de chaque actif) et leur cours
+    server.Get("/api/v1/market/assets", [&](const httplib::Request&, httplib::Response& res) {
+        const json prices = priceBook.prices(registry, chain.price());
+        json assets = json::array();
+        auto add = [&](const vyfttrade::Asset& a, const std::string& status) {
+            for (const auto& existing : assets)
+                if (existing.value("symbol", "") == a.symbol) return;
+            json entry = vyfttrade::toJson(a);
+            entry["status"] = status;
+            if (prices.contains(a.symbol)) {
+                entry["eur"] = prices.at(a.symbol).value("eur", json(nullptr));
+                entry["vez"] = prices.at(a.symbol).value("vez", json(nullptr));
+            }
+            assets.push_back(entry);
+        };
+        add(vyfttrade::kVezAssetInfo, "listed");
+        for (const auto& p : registry.pairs(true)) add(p.base, p.status);
+        reply(res, 200, {{"assets", assets}});
+    });
+
+    server.Get("/api/v1/market/prices", [&](const httplib::Request&, httplib::Response& res) {
+        reply(res, 200, {{"prices", priceBook.prices(registry, chain.price())}, {"updated_at", nowIso()}});
+    });
+
+    // ── Administration : listing et délisting (X-ADMIN-KEY = VYFTTRADE_ADMIN_KEY) ──
+    auto adminAllowed = [&](const httplib::Request& req, httplib::Response& res) {
+        if (adminKey.empty()) {
+            reply(res, 503, {{"error", "Administration désactivée : définissez VYFTTRADE_ADMIN_KEY"}});
+            return false;
+        }
+        if (req.get_header_value("X-ADMIN-KEY") != adminKey) {
+            reply(res, 401, {{"error", "Clé d'administration invalide"}});
+            return false;
+        }
+        return true;
+    };
+
+    server.Post("/api/v1/admin/pairs", [&](const httplib::Request& req, httplib::Response& res) {
+        if (!adminAllowed(req, res)) return;
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (...) {
+            reply(res, 400, {{"error", "Corps JSON invalide"}});
+            return;
+        }
+        vyfttrade::TokenProbe probe{[&](const std::string& t) { return chain.hasCode(t); },
+                                    [&](const std::string& t) { return chain.tokenDecimals(t); }};
+        auto [status, result] = registry.list(body, probe);
+        reply(res, status, result);
+    });
+
+    server.Delete(R"(/api/v1/admin/pairs/([A-Za-z0-9]+)[-_]([A-Za-z0-9]+))", [&](const httplib::Request& req, httplib::Response& res) {
+        if (!adminAllowed(req, res)) return;
+        auto [status, result] = registry.delist(std::string(req.matches[1]) + "/" + std::string(req.matches[2]));
+        reply(res, status, result);
     });
 
     // Prix, offre du pool, frais actuels et levier maximum proposé pour une mise
