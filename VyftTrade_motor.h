@@ -23,8 +23,8 @@
 //    La mise reste sur le wallet du client, aucun VEZ n'est transféré à l'ouverture.
 //  - Stop loss : la position est fermée sans perte ni gain (résultat nul).
 //  - Gain : mise × levier × variation du prix, plafonné à mise × levier × kGainCapMove,
-//    versé en VEZ par la trésorerie Vyft Trade (SDK vyfttxl_mate).
-//  - Levier maximum : VEZ disponibles en trésorerie ÷ (mise × kGainCapMove).
+//    émis en VEZ sur l'offre totale (preuve de réserves, POST /api/mint).
+//  - Levier maximum : VEZ encore émissibles (availableToMint) ÷ (mise × kGainCapMove).
 //  - cancel_order clôt la position (orderid) au prix courant.
 
 #pragma once
@@ -121,10 +121,10 @@ TradeResult sendOrder(const Order& order, const std::string& url = kTradeUrl,
 
 // ── Positions à effet de levier ──
 
-// Levier maximum pour une mise, selon les VEZ disponibles en trésorerie (0 = position impossible)
+// Levier maximum pour une mise, selon les VEZ encore émissibles (0 = position impossible)
 double maxLeverage(double stake, double availableVez);
 
-// Gain maximum réservé en trésorerie pour une position (VEZ)
+// Gain maximum réservé sur l'offre émissible pour une position (VEZ)
 double maxGain(double stake, double leverage);
 
 // Stop automatique : là où une position classique aurait perdu toute sa mise

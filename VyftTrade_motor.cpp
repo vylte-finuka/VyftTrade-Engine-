@@ -260,7 +260,7 @@ std::optional<std::string> validatePosition(const Position& p, double availableV
     if (p.side == TradeType::Sell && !(p.stopLoss > p.entryPrice))
         return std::string("Le stop loss d'une position à la baisse doit être au-dessus du prix d'entrée");
     const double limit = maxLeverage(p.stake, availableVez);
-    if (limit < 1) return std::string("Offre insuffisante en trésorerie pour couvrir cette mise");
+    if (limit < 1) return std::string("Offre émissible insuffisante (preuve de réserves) pour couvrir cette mise");
     if (p.leverage > limit) return "Levier maximum pour cette mise : x" + formatDecimal(limit, 0);
     return std::nullopt;
 }

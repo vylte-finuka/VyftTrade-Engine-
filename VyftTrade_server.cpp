@@ -9,13 +9,13 @@
 //
 // Lancement : VyftTradeServer [port=8080] [fichier=orders.json]
 //   VYFTTRADE_API_KEY       facultatif : exige l'en-tête X-API-KEY sur /api
-//   VYFTTRADE_SETTLER_URL   service de règlement SDK (défaut http://127.0.0.1:8090)
+//   VYFTTRADE_SETTLER_URL   service de règlement (défaut http://127.0.0.1:8090)
 //   SETTLER_TOKEN           facultatif : jeton partagé avec le service de règlement
 //   VYFTTRADE_POLL_SECONDS  intervalle de surveillance des stop loss (défaut 15)
 // Le TLS est assuré par le proxy frontal (vyft-trade.vyft-one.com → ce service en HTTP).
 //
 // Règles (voir VyftTrade_motor.h) : la mise reste sur le wallet du client ; au stop loss la position
-// est fermée sans perte ni gain ; un gain est versé en VEZ par la trésorerie via le SDK vyfttxl_mate.
+// est fermée sans perte ni gain ; un gain est émis en VEZ sur l'offre totale (POST /api/mint de la preuve de réserves).
 
 #include "VyftTrade_motor.h"
 
@@ -120,7 +120,7 @@ vyfttrade::Position toPosition(const json& p) {
     return pos;
 }
 
-// ── Service de règlement (SDK vyfttxl_mate) ──
+// ── Service de règlement (émission via la preuve de réserves VEzcustody) ──
 class Settler {
 public:
     Settler(std::string url, std::string token) : url_(std::move(url)), token_(std::move(token)) {}
@@ -130,9 +130,9 @@ public:
         return body ? std::optional<double>(number(*body, "price")) : std::nullopt;
     }
 
-    // VEZ de la trésorerie (nullopt si non configurée ou injoignable)
-    std::optional<double> treasury() {
-        auto body = get("/treasury");
+    // VEZ encore émissibles (availableToMint de la preuve de réserves ; nullopt si injoignable)
+    std::optional<double> mintable() {
+        auto body = get("/mintable");
         return body ? std::optional<double>(number(*body, "balance")) : std::nullopt;
     }
 
@@ -182,7 +182,7 @@ private:
     std::string token_;
 };
 
-// Statuts qui gardent un gain réservé en trésorerie
+// Statuts qui gardent un gain réservé sur l'offre émissible
 bool reservesGain(const std::string& status) {
     return status == "open" || status == "closing" || status == "payout_pending" || status == "payout_review";
 }
@@ -215,11 +215,11 @@ public:
         return openStakeLocked(wallet);
     }
 
-    // Ouvre la position si la trésorerie et le solde du client la couvrent encore (vérifié sous verrou)
-    std::pair<int, json> open(json position, double treasury, double walletBalance) {
+    // Ouvre la position si l'offre émissible et le solde du client la couvrent encore (vérifié sous verrou)
+    std::pair<int, json> open(json position, double mintable, double walletBalance) {
         std::lock_guard<std::mutex> lock(mutex_);
         const vyfttrade::Position pos = toPosition(position);
-        const double available = std::max(0.0, treasury - reservedLocked());
+        const double available = std::max(0.0, mintable - reservedLocked());
         if (auto error = vyfttrade::validatePosition(pos, available)) return {422, {{"error", *error}}};
         const std::string wallet = position.value("wallet", "");
         if (openStakeLocked(wallet) + pos.stake > walletBalance + 1e-9)
@@ -395,13 +395,13 @@ int main(int argc, char** argv) {
             reply(res, 503, {{"error", "Prix VEZ indisponible"}});
             return;
         }
-        const double treasury = settler.treasury().value_or(0);
+        const double mintable = settler.mintable().value_or(0);
         const double reserved = store.reserved();
-        const double available = std::max(0.0, treasury - reserved);
+        const double available = std::max(0.0, mintable - reserved);
         const double maxLev = vyfttrade::maxLeverage(stake, available);
         json quote = {
             {"price", decimal(*price)},
-            {"treasury", vyfttrade::formatQuantity(treasury)},
+            {"mintable", vyfttrade::formatQuantity(mintable)},
             {"reserved", vyfttrade::formatQuantity(reserved)},
             {"available", vyfttrade::formatQuantity(available)},
             {"gaincapmove", decimal(vyfttrade::kGainCapMove, 4)},
@@ -467,9 +467,9 @@ int main(int argc, char** argv) {
         }
 
         auto balance = settler.balance(order.action.wallet);
-        auto treasury = settler.treasury();
-        if (!balance || !treasury) {
-            reply(res, 503, {{"error", "Solde ou trésorerie indisponible (service de règlement)"}});
+        auto mintable = settler.mintable();
+        if (!balance || !mintable) {
+            reply(res, 503, {{"error", "Solde ou offre émissible indisponible (service de règlement)"}});
             return;
         }
 
@@ -499,7 +499,7 @@ int main(int argc, char** argv) {
             {"created_at", nowIso()},
             {"updated_at", nowIso()},
         };
-        auto [status, result] = store.open(position, *treasury, *balance);
+        auto [status, result] = store.open(position, *mintable, *balance);
         reply(res, status, result);
     });
 
