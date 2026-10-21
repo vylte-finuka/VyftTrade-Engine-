@@ -47,7 +47,7 @@ Sous Windows l'envoi passe par WinHTTP ; ailleurs par libcurl. L'interface C `Tr
 
 ### Serveur API
 
-`VyftTradeServer [port=8080] [fichier=orders.json]` sert l'API derrière le proxy HTTPS de
+`VyftTradeServer [port=1542] [fichier=orders.json]` sert l'API derrière le proxy HTTPS de
 `vyft-trade.vyft-one.com`.
 
 Déploiement (Linux avec Docker) :
@@ -57,10 +57,10 @@ git clone https://github.com/vylte-finuka/VyftTrade-Engine-.git vyfttrade
 cd vyfttrade
 cp .env.example .env        # renseigner VYFTTRADE_POOL_ADDRESS et VYFTTRADE_POOL_SEED
 docker compose up -d --build
-curl http://127.0.0.1:8080/health
+curl http://127.0.0.1:1542/health
 ```
 
-Le service écoute sur `127.0.0.1:8080` ; un proxy HTTPS (Caddy, nginx) le publie sur
+Le service écoute sur `127.0.0.1:1542` ; un proxy HTTPS (Caddy, nginx) le publie sur
 `vyft-trade.vyft-one.com`. Les positions sont gardées dans le volume Docker `trade-data`.
 Mise à jour : `git pull` puis `docker compose up -d --build`.
 

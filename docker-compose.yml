@@ -4,7 +4,7 @@ services:
   trade:
     build: .
     ports:
-      - "127.0.0.1:8080:8080"  # derrière le proxy HTTPS de vyft-trade.vyft-one.com
+      - "127.0.0.1:1542:1542"  # derrière le proxy HTTPS de vyft-trade.vyft-one.com
     environment:
       VYFTTRADE_API_KEY: ${VYFTTRADE_API_KEY:-}
       VYFTTRADE_POLL_SECONDS: ${VYFTTRADE_POLL_SECONDS:-15}

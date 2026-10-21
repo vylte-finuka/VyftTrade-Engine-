@@ -9,7 +9,7 @@
 //   GET  /api/v1/trade/orders/<orderid>        une position
 //   GET  /health                               état du service
 //
-// Lancement : VyftTradeServer [port=8080] [fichier=orders.json]
+// Lancement : VyftTradeServer [port=1542] [fichier=orders.json]
 //   VYFTTRADE_API_KEY       facultatif : exige l'en-tête X-API-KEY sur /api
 //   VYFTTRADE_POLL_SECONDS  intervalle de surveillance des stop loss (défaut 15)
 //   VYFTTRADE_POOL_SEED     VEZ du pool VyftHealth alloués au trading par Vyft (défaut 0 : trading fermé)
@@ -511,7 +511,7 @@ void reply(httplib::Response& res, int status, const json& body) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    const int port = argc > 1 ? std::atoi(argv[1]) : 8080;
+    const int port = argc > 1 ? std::atoi(argv[1]) : 1542;
     const std::filesystem::path dataFile = argc > 2 ? argv[2] : "orders.json";
     auto envOr = [](const char* name, const char* fallback) {
         const char* v = std::getenv(name);

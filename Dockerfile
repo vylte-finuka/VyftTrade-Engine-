@@ -13,5 +13,5 @@ RUN apt-get update && apt-get install -y --no-install-recommends libcurl4 ca-cer
 COPY --from=build /src/build/VyftTradeServer /usr/local/bin/VyftTradeServer
 # Positions persistantes : monter un volume sur /data
 VOLUME /data
-EXPOSE 8080
-CMD ["VyftTradeServer", "8080", "/data/orders.json"]
+EXPOSE 1542
+CMD ["VyftTradeServer", "1542", "/data/orders.json"]
