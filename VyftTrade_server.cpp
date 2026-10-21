@@ -31,7 +31,6 @@
 //   VYFTTRADE_POOL_SEED     VEZ du pool VyftHealth alloués au trading par Vyft (défaut 0 : trading fermé)
 //   VYFTTRADE_POOL_ADDRESS  contrat VyftHealth (défaut 0x352aBa76dDC0c4002134333417543fbb268b21a1)
 //   VYFT_RPC_URL            RPC Slura (défaut https://slu-charene.vyft-one.com)
-//   POR_URL                 preuve de réserves (défaut https://por.vyft-one.com/api/mint)
 // Le TLS est assuré par le proxy frontal (vyft-trade.vyft-one.com → ce service en HTTP).
 //
 // Règles (voir VyftTrade_motor.h) : la mise reste sur le wallet du client ; au stop loss la position
@@ -165,7 +164,7 @@ vyfttrade::Position toPosition(const json& p) {
     return pos;
 }
 
-// ── Lectures sur Slura et la preuve de réserves (aucune clé, lecture seule) ──
+// ── Lectures sur Slura (aucune clé, lecture seule) ──
 // Sélecteurs : keccak256(signature)[0:4] ; événement vezRedeemed(address,uint256,address,bytes32)
 constexpr const char* kSelVezToken = "0x07eb54a9";          // vezToken()
 constexpr const char* kSelDecimals = "0x313ce567";          // decimals()
@@ -187,26 +186,10 @@ enum class PayoutCheck { Valid, Pending, Invalid };
 
 class Chain {
 public:
-    Chain(std::string rpcUrl, std::string porUrl, std::string pool)
-        : rpcUrl_(std::move(rpcUrl)), porUrl_(std::move(porUrl)), pool_(lower(std::move(pool))) {}
+    Chain(std::string rpcUrl, std::string pool) : rpcUrl_(std::move(rpcUrl)), pool_(lower(std::move(pool))) {}
 
     const std::string& pool() const { return pool_; }
 
-    // Prix d'1 VEZ en EUR : réserve EUR ÷ offre (ou prix direct s'il est publié)
-    std::optional<double> price() {
-        const auto res = vyfttrade::httpGet(porUrl_);
-        if (!res.ok) return std::nullopt;
-        try {
-            const json data = json::parse(res.body);
-            const double direct = number(data, "priceEUR", number(data, "price"));
-            const double reserve = number(data, "reserveEUR");
-            const double supply = number(data, "totalSupply");
-            const double value = direct > 0 ? direct : (reserve > 0 && supply > 0 ? reserve / supply : 0);
-            if (value > 0 && std::isfinite(value)) return value;
-        } catch (...) {
-        }
-        return std::nullopt;
-    }
 
     // Réglages et solde du pool VyftHealth, lus sur la chaîne (décimales du jeton comprises)
     std::optional<PoolInfo> poolInfo() {
@@ -363,7 +346,6 @@ private:
     }
 
     std::string rpcUrl_;
-    std::string porUrl_;
     std::string pool_;
     int decimals_ = 0;
     std::mutex mutex_;
@@ -603,7 +585,6 @@ int main(int argc, char** argv) {
     const double poolSeed = std::max(0.0, std::strtod(envOr("VYFTTRADE_POOL_SEED", "0").c_str(), nullptr));
     PositionStore store(dataFile, std::isfinite(poolSeed) ? poolSeed : 0);
     Chain chain(envOr("VYFT_RPC_URL", "https://slu-charene.vyft-one.com"),
-                envOr("POR_URL", "https://por.vyft-one.com/api/mint"),
                 envOr("VYFTTRADE_POOL_ADDRESS", "0x352aBa76dDC0c4002134333417543fbb268b21a1"));
 
     // Paires listées : à côté du fichier des positions (pairs.json), ou VYFTTRADE_PAIRS_FILE
@@ -627,13 +608,13 @@ int main(int argc, char** argv) {
     vyfttrade::OrderBook book(envOr("VYFTTRADE_BOOK_FILE", (dataFile.parent_path() / "book.json").string().c_str()),
                               bookConfig);
 
-    // Cours de référence d'une paire en unités de cotation (VEZ) : source externe convertie via la preuve de réserves
+    // Cours de référence d'une paire en unités de cotation (VEZ) : source externe convertie avec le cours VEZ/EUR
     auto indexInQuote = [&](const vyfttrade::Pair& p) -> std::optional<double> {
         if (!p.index || p.quote.symbol != "VEZ") return std::nullopt;
         auto value = priceBook.indexValue(*p.index);
         if (!value) return std::nullopt;
         if (p.index->currency == "VEZ") return value;
-        auto vezEur = chain.price();
+        auto vezEur = priceBook.vezEur(registry);
         if (!vezEur || *vezEur <= 0) return std::nullopt;
         return *value / *vezEur;
     };
@@ -666,7 +647,7 @@ int main(int argc, char** argv) {
 
     // Actifs à proposer dans l'app (jeton et décimales pour créer le wallet de chaque actif) et leur cours
     server.Get("/api/v1/market/assets", [&](const httplib::Request&, httplib::Response& res) {
-        const json prices = priceBook.prices(registry, chain.price());
+        const json prices = priceBook.prices(registry);
         json assets = json::array();
         auto add = [&](const vyfttrade::Asset& a, const std::string& status) {
             for (const auto& existing : assets)
@@ -685,7 +666,7 @@ int main(int argc, char** argv) {
     });
 
     server.Get("/api/v1/market/prices", [&](const httplib::Request&, httplib::Response& res) {
-        reply(res, 200, {{"prices", priceBook.prices(registry, chain.price())}, {"updated_at", nowIso()}});
+        reply(res, 200, {{"prices", priceBook.prices(registry)}, {"updated_at", nowIso()}});
     });
 
     // ── Administration : listing et délisting (X-ADMIN-KEY = VYFTTRADE_ADMIN_KEY) ──
@@ -858,9 +839,9 @@ int main(int argc, char** argv) {
     server.Get("/api/v1/trade/quote", [&](const httplib::Request& req, httplib::Response& res) {
         const std::string wallet = req.get_param_value("wallet");
         const double stake = std::strtod(req.get_param_value("stake").c_str(), nullptr);
-        auto price = chain.price();
+        auto price = priceBook.vezEur(registry);
         if (!price) {
-            reply(res, 503, {{"error", "Prix VEZ indisponible (preuve de réserves)"}});
+            reply(res, 503, {{"error", "Cours VEZ indisponible : listez la paire VEZ/EUR avec sa source de cours"}});
             return;
         }
         const PoolInfo info = chain.poolInfo().value_or(PoolInfo{});
@@ -926,9 +907,9 @@ int main(int argc, char** argv) {
             return;
         }
 
-        auto price = chain.price();
+        auto price = priceBook.vezEur(registry);
         if (!price) {
-            reply(res, 503, {{"error", "Prix VEZ indisponible (preuve de réserves)"}});
+            reply(res, 503, {{"error", "Cours VEZ indisponible : listez la paire VEZ/EUR avec sa source de cours"}});
             return;
         }
 
@@ -1040,7 +1021,7 @@ int main(int argc, char** argv) {
     std::atomic<bool> running{true};
     std::thread monitor([&] {
         while (running) {
-            if (auto price = chain.price()) {
+            if (auto price = priceBook.vezEur(registry)) {
                 for (const auto& id : store.idsWithStatus("open")) {
                     auto position = store.find(id);
                     if (!position) continue;

@@ -12,7 +12,6 @@ services:
       VYFTTRADE_POOL_ADDRESS: ${VYFTTRADE_POOL_ADDRESS:-0x352aBa76dDC0c4002134333417543fbb268b21a1}
       VYFTTRADE_ADMIN_KEY: ${VYFTTRADE_ADMIN_KEY:-}
       VYFT_RPC_URL: ${VYFT_RPC_URL:-https://slu-charene.vyft-one.com}
-      POR_URL: ${POR_URL:-https://por.vyft-one.com/api/mint}
     volumes:
       - trade-data:/data
     restart: unless-stopped

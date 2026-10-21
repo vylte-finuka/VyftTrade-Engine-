@@ -119,6 +119,15 @@ faire, avec les destinataires et les montants exacts. Les frais (`VYFTTRADE_TRAD
 `…/candles?interval=1m|5m|15m|1h|4h|1d`. Le ticker donne le dernier prix, la variation, le volume sur
 24 h, le cours de référence, le prix de marque et le sentiment (part acheteuse et vendeuse).
 
+**Cours du VEZ.** Le VEZ se liste comme les autres actifs, coté en EUR (paire de cours `VEZ/EUR`, aucun
+échange possible) : son cours vient de la source donnée au listing. Il sert aux positions à levier et à
+convertir en EUR / VEZ le cours des autres actifs. Sans cette paire, le cours du VEZ est indisponible.
+```sh
+curl -X POST …/api/v1/admin/pairs -H "X-ADMIN-KEY: …" -H "Content-Type: application/json" \
+  -d '{"base":{"symbol":"VEZ","token":"0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"},"quote":{"symbol":"EUR"},
+       "index":{"url":"https://…","path":"…","currency":"EUR"}}'
+```
+
 **Offre du pool.** Le serveur lit sur Slura le solde du pool, son plafond de versement
 (`MAX_TRANSFER_AMOUNT`), `earnRatio` et les décimales du VEZ. La part réservée au trading est fixée par
 `VYFTTRADE_POOL_SEED` (0 par défaut : trading fermé) ; les récompenses de pas n'y sont jamais prises.
@@ -129,7 +138,6 @@ faire, avec les destinataires et les montants exacts. Les frais (`VYFTTRADE_TRAD
 | `VYFTTRADE_POOL_ADDRESS` | `0x352aBa76dDC0c4002134333417543fbb268b21a1` |
 | `VYFTTRADE_ADMIN_KEY` | aucune (administration fermée) |
 | `VYFT_RPC_URL` | `https://slu-charene.vyft-one.com` |
-| `POR_URL` | `https://por.vyft-one.com/api/mint` |
 | `VYFTTRADE_API_KEY` | aucune |
 | `VYFTTRADE_POLL_SECONDS` | `15` |
 

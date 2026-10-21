@@ -186,9 +186,21 @@ std::pair<int, json> MarketRegistry::list(const json& request, const TokenProbe&
     if (!isSymbol(pair.base.symbol)) return {400, {{"error", "base.symbol invalide (2 à 12 caractères A-Z, 0-9)"}}};
     if (!isAddress(pair.base.token)) return {400, {{"error", "base.token : adresse du jeton (0x + 40 caractères) requise"}}};
 
-    // Cotation : VEZ par défaut
+    // VEZ : listé comme les autres actifs, coté en EUR (paire de cours VEZ/EUR, source obligatoire)
     const json quoteIn = request.value("quote", json::object());
-    if (quoteIn.empty() || upper(text(quoteIn, "symbol")) == "VEZ") {
+    const bool vezListing = pair.base.symbol == kVezAssetInfo.symbol || pair.base.token == kVezAssetInfo.token;
+    if (vezListing) {
+        if (pair.base.symbol != kVezAssetInfo.symbol || pair.base.token != kVezAssetInfo.token)
+            return {400, {{"error", "Le VEZ se liste avec le symbole VEZ et le jeton " + kVezAssetInfo.token}}};
+        if (!quoteIn.empty() && upper(text(quoteIn, "symbol")) != "EUR")
+            return {400, {{"error", "Le VEZ est coté en EUR (paire VEZ/EUR)"}}};
+        const json i = request.value("index", json::object());
+        if (upper(text(i, "currency").empty() ? "EUR" : text(i, "currency")) != "EUR")
+            return {400, {{"error", "index.currency : EUR pour le VEZ"}}};
+        pair.quote = kEurAssetInfo;
+    } else if (!quoteIn.empty() && upper(text(quoteIn, "symbol")) == "EUR") {
+        return {400, {{"error", "Seul le VEZ est coté en EUR ; les autres actifs sont cotés en VEZ"}}};
+    } else if (quoteIn.empty() || upper(text(quoteIn, "symbol")) == "VEZ") {
         pair.quote = kVezAssetInfo;
     } else {
         auto quote = find(upper(text(quoteIn, "symbol")) + "/VEZ");
@@ -220,6 +232,7 @@ std::pair<int, json> MarketRegistry::list(const json& request, const TokenProbe&
             return {400, {{"error", "index.currency : EUR ou VEZ"}}};
         pair.index = source;
     }
+    if (vezListing && !pair.index) return {400, {{"error", "index (url, path) requis : c'est la source du cours du VEZ"}}};
 
     std::lock_guard<std::mutex> lock(mutex_);
     for (auto& p : pairs_) {
@@ -247,7 +260,7 @@ std::pair<int, json> MarketRegistry::delist(const std::string& symbol) {
         if (p.symbol() != wanted) continue;
         if (p.status != "listed") return {409, {{"error", "Paire déjà délistée"}}};
         for (const auto& other : pairs_)
-            if (other.status == "listed" && other.quote.symbol == p.base.symbol && p.quote.symbol == "VEZ")
+            if (other.status == "listed" && other.quote.symbol == p.base.symbol && (p.quote.symbol == "VEZ" || p.quote.symbol == "EUR"))
                 return {409, {{"error", "Délistez d'abord " + other.symbol() + ", cotée en " + p.base.symbol}}};
         p.status = "delisted";
         p.delistedAt = nowUtc();
@@ -283,15 +296,28 @@ std::optional<double> PriceBook::indexValue(const IndexSource& source) {
     return value;
 }
 
-json PriceBook::prices(MarketRegistry& registry, std::optional<double> vezEur) {
+std::optional<double> PriceBook::vezEur(MarketRegistry& registry) {
+    auto pair = registry.find(std::string(kVezAssetInfo.symbol) + "/" + kEurAssetInfo.symbol);
+    if (!pair || pair->status != "listed" || !pair->index) return std::nullopt;
+    return indexValue(*pair->index);
+}
+
+json PriceBook::prices(MarketRegistry& registry) {
     json out = json::object();
-    out["VEZ"] = {{"eur", vezEur ? json(*vezEur) : json(nullptr)}, {"vez", 1}, {"source", "proof-of-reserves"}};
+    const std::optional<double> vezEurValue = vezEur(registry);
+    out["VEZ"] = {{"eur", vezEurValue ? json(*vezEurValue) : json(nullptr)}, {"vez", 1}};
     for (const auto& p : registry.pairs()) {
+        if (p.base.symbol == kVezAssetInfo.symbol) {   // paire de cours VEZ/EUR
+            out["VEZ"]["pair"] = p.symbol();
+            if (p.index) out["VEZ"]["source"] = p.index->url;
+            continue;
+        }
+        const std::optional<double>& vezEur = vezEurValue;
         json entry = {{"pair", p.symbol()}, {"eur", nullptr}, {"vez", nullptr}};
         if (p.index) {
             entry["source"] = p.index->url;
             if (auto v = indexValue(*p.index)) {
-                // Cours de référence en EUR ou en VEZ, converti dans l'autre devise via la preuve de réserves
+                // Cours de référence en EUR ou en VEZ, converti dans l'autre devise avec le cours du VEZ
                 const double eur = p.index->currency == "EUR" ? *v : (vezEur ? *v * *vezEur : NAN);
                 const double vez = p.index->currency == "VEZ" ? *v : (vezEur && *vezEur > 0 ? *v / *vezEur : NAN);
                 if (std::isfinite(eur)) entry["eur"] = eur;

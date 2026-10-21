@@ -4,7 +4,7 @@
 // défaut) associe chaque actif à son jeton sur Slura : l'app crée pour chaque client un wallet VyftVEZ
 // dont l'adresse du jeton est remplacée par celle de l'actif. Vyft Trade ne détient aucun fonds.
 //
-// Cours : le VEZ vaut réserve EUR ÷ offre (preuve de réserves) ; un actif listé prend le cours de sa
+// Cours : le VEZ est listé comme les autres actifs (paire de cours VEZ/EUR, jeton 0xeeee…) ; chaque actif prend le cours de sa
 // source de référence (adresse web + chemin du champ dans la réponse JSON), en EUR ou en VEZ.
 
 #pragma once
@@ -52,6 +52,9 @@ struct Pair {
 // Jeton VEZ de Slura (cotation par défaut)
 inline const Asset kVezAssetInfo{"VEZ", "Vyft VEZ", "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", 18};
 
+// Euro : cotation de la seule paire de cours VEZ/EUR (aucun jeton, aucun échange possible)
+inline const Asset kEurAssetInfo{"EUR", "Euro", "", 2};
+
 json toJson(const Pair& pair);
 json toJson(const Asset& asset);
 
@@ -90,8 +93,11 @@ public:
     // Cours d'1 actif dans une devise de référence ; nullopt si la source ne répond pas
     std::optional<double> indexValue(const IndexSource& source);
 
-    // { "VEZ": { eur, vez: 1 }, "XAU": { eur, vez, pair, source }, … }
-    json prices(MarketRegistry& registry, std::optional<double> vezEur);
+    // Cours d'1 VEZ en EUR : source de la paire VEZ/EUR listée ; nullopt si non listée ou sans réponse
+    std::optional<double> vezEur(MarketRegistry& registry);
+
+    // { "VEZ": { eur, vez: 1, pair, source }, "XAU": { eur, vez, pair, source }, … }
+    json prices(MarketRegistry& registry);
 
 private:
     struct Cached {

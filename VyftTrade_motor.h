@@ -51,7 +51,7 @@ inline constexpr const char* kVezAsset = "VEZ";
 inline constexpr const char* kVezName = "Vyft VEZ";
 inline constexpr const char* kVezChain = "SLU";
 inline constexpr int kVezDecimals = 6;          // plus petite unité : 0,000001 VEZ
-inline constexpr double kVezPriceEur = 1.0;     // prix de repli (le serveur lit la preuve de réserves)
+inline constexpr double kVezPriceEur = 1.0;     // prix de repli (le serveur lit le cours VEZ/EUR listé)
 
 // Variation de prix couverte par position : le gain est plafonné à mise × levier × 50 %
 // (la position est clôturée automatiquement à ce plafond)
@@ -129,7 +129,7 @@ std::string buildOrderJson(const Order& order);
 TradeResult sendOrder(const Order& order, const std::string& url = kTradeUrl,
                       const std::string& apiKey = "");
 
-// Requêtes HTTP(S) brutes (WinHTTP sous Windows, libcurl ailleurs) : preuve de réserves, RPC Slura
+// Requêtes HTTP(S) brutes (WinHTTP sous Windows, libcurl ailleurs) : sources de cours, RPC Slura
 TradeResult httpGet(const std::string& url);
 TradeResult httpPostJson(const std::string& url, const std::string& body, const std::string& apiKey = "");
 

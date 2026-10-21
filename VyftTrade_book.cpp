@@ -247,6 +247,8 @@ std::optional<std::string> OrderBook::suspension(const std::string& account) {
 
 std::pair<int, json> OrderBook::place(const Pair& pair, const json& request) {
     if (pair.status != "listed") return {409, {{"error", "Paire délistée"}}};
+    if (pair.quote.token.empty() || pair.base.token.empty())
+        return {409, {{"error", pair.symbol() + " est une paire de cours : aucun échange possible"}}};
     BookOrder order;
     order.id = newId("ob_");
     order.pair = pair.symbol();
