@@ -22,9 +22,15 @@
 //  - execute_order ouvre une position : buy = à la hausse, sell = à la baisse ; quantity = mise en VEZ.
 //    La mise reste sur le wallet du client, aucun VEZ n'est transféré à l'ouverture.
 //  - Stop loss : la position est fermée sans perte ni gain (résultat nul).
-//  - Gain : mise × levier × variation du prix, plafonné à mise × levier × kGainCapMove,
-//    émis en VEZ sur l'offre totale (preuve de réserves, POST /api/mint).
-//  - Levier maximum : VEZ encore émissibles (availableToMint) ÷ (mise × kGainCapMove).
+//  - Gain brut : mise × levier × variation du prix. Ni le gain ni le levier n'ont de plafond fixe :
+//    seule l'offre du pool les limite. À l'ouverture, la position réserve dans le pool son gain
+//    maximum (mise × levier × kGainCapMove) et se clôt automatiquement quand elle l'atteint.
+//  - Frais dynamiques sur le profit : taux entre kProfitFeeMin et kProfitFeeMax selon la tension
+//    du pool (liquidité de trading entamée, gains réservés) ; les frais restent dans le pool
+//    VyftHealth, le client reçoit le gain net (versé par l'app avec le SDK vyfttxl_mate).
+//  - Levier maximum : offre disponible ÷ (mise × kGainCapMove × (1 − kProfitFeeMin)), l'offre étant
+//    la liquidité de trading libre, bornée par le solde du pool et le plafond de versement du contrat
+//    (lus sur la chaîne).
 //  - cancel_order clôt la position (orderid) au prix courant.
 
 #pragma once
@@ -50,6 +56,10 @@ inline constexpr double kVezPriceEur = 1.0;     // prix de repli (le serveur lit
 // Variation de prix couverte par position : le gain est plafonné à mise × levier × 50 %
 // (la position est clôturée automatiquement à ce plafond)
 inline constexpr double kGainCapMove = 0.5;
+
+// Frais sur le profit : 10 % quand le pool est intact, jusqu'à 90 % quand il est épuisé ou engagé
+inline constexpr double kProfitFeeMin = 0.10;
+inline constexpr double kProfitFeeMax = 0.90;
 
 enum class TradeType { Buy, Sell };
 enum class ActionType { ExecuteOrder, CancelOrder };
@@ -119,19 +129,43 @@ std::string buildOrderJson(const Order& order);
 TradeResult sendOrder(const Order& order, const std::string& url = kTradeUrl,
                       const std::string& apiKey = "");
 
+// Requêtes HTTP(S) brutes (WinHTTP sous Windows, libcurl ailleurs) : preuve de réserves, RPC Slura
+TradeResult httpGet(const std::string& url);
+TradeResult httpPostJson(const std::string& url, const std::string& body, const std::string& apiKey = "");
+
 // ── Positions à effet de levier ──
 
-// Levier maximum pour une mise, selon les VEZ encore émissibles (0 = position impossible)
-double maxLeverage(double stake, double availableVez);
+// Levier maximum pour une mise, selon l'offre disponible (0 = position impossible)
+//   maxTransferVez : plafond d'un versement du contrat (0 = aucun)
+double maxLeverage(double stake, double availableVez, double maxTransferVez = 0);
 
-// Gain maximum réservé sur l'offre émissible pour une position (VEZ)
+// Gain brut maximum d'une position (VEZ)
 double maxGain(double stake, double leverage);
+
+// Versement net maximum, réservé dans le pool tant que la position est ouverte (frais minimum)
+double maxPayout(double stake, double leverage);
+
+// Taux de frais sur le profit selon la tension du pool :
+//   health      = liquidité de trading restante ÷ liquidité de départ (1 = intacte, 0 = épuisée)
+//   utilization = gains réservés ÷ liquidité de trading restante
+// taux = kProfitFeeMin + (kProfitFeeMax − kProfitFeeMin) × max(1 − health, utilization)
+double profitFeeRate(double health, double utilization);
+
+// Partage d'un gain brut : frais (restent dans le pool) et net (versé au client), en unités VEZ
+struct ProfitSplit {
+    double gross = 0;
+    double feeRate = 0;
+    double fee = 0;
+    double net = 0;
+};
+ProfitSplit splitProfit(double gross, double feeRate);
 
 // Stop automatique : là où une position classique aurait perdu toute sa mise
 double autoStopLoss(TradeType side, double entryPrice, double leverage);
 
 // Vérifie une position avant ouverture ; renvoie un message d'erreur ou std::nullopt
-std::optional<std::string> validatePosition(const Position& position, double availableVez);
+std::optional<std::string> validatePosition(const Position& position, double availableVez,
+                                            double maxTransferVez = 0);
 
 // Résultat brut au prix donné (VEZ, négatif en cas de baisse pour un long)
 double positionResult(const Position& position, double price);
@@ -139,7 +173,7 @@ double positionResult(const Position& position, double price);
 // Clôture automatique au prix donné : stop loss atteint, ou plafond de gain atteint
 CloseReason checkClose(const Position& position, double price);
 
-// VEZ versés au client à la clôture : 0 au stop loss ou en perte, gain plafonné sinon
+// Gain brut à la clôture : 0 au stop loss ou en perte, gain plafonné sinon (avant frais)
 double settlementAmount(const Position& position, double price, CloseReason reason);
 
 const char* toString(CloseReason value);

@@ -81,8 +81,8 @@ std::wstring widen(const std::string& value) {
     return out;
 }
 
-// POST HTTPS via WinHTTP (inclus dans Windows)
-TradeResult postJson(const std::string& url, const std::string& body, const std::string& apiKey) {
+// Requête HTTP(S) via WinHTTP (inclus dans Windows) ; body ignoré en GET
+TradeResult request(const wchar_t* verb, const std::string& url, const std::string& body, const std::string& apiKey) {
     TradeResult result;
     std::wstring wurl = widen(url);
     URL_COMPONENTS parts{};
@@ -102,17 +102,20 @@ TradeResult postJson(const std::string& url, const std::string& body, const std:
                                     WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     HINTERNET connect = session ? WinHttpConnect(session, host, parts.nPort, 0) : nullptr;
     DWORD flags = parts.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0;
-    HINTERNET request = connect ? WinHttpOpenRequest(connect, L"POST", path, nullptr, WINHTTP_NO_REFERER,
+    HINTERNET request = connect ? WinHttpOpenRequest(connect, verb, path, nullptr, WINHTTP_NO_REFERER,
                                                      WINHTTP_DEFAULT_ACCEPT_TYPES, flags)
                                 : nullptr;
 
-    std::wstring headers = L"Content-Type: application/json\r\nAccept: application/json\r\n";
+    const bool isPost = std::wstring(verb) == L"POST";
+    std::wstring headers = isPost ? L"Content-Type: application/json\r\nAccept: application/json\r\n"
+                                  : L"Accept: application/json\r\n";
     if (!apiKey.empty()) headers += L"X-API-KEY: " + widen(apiKey) + L"\r\n";
+    const DWORD length = isPost ? static_cast<DWORD>(body.size()) : 0;
 
     bool sent = request &&
                 WinHttpSendRequest(request, headers.c_str(), static_cast<DWORD>(-1L),
-                                   const_cast<char*>(body.data()), static_cast<DWORD>(body.size()),
-                                   static_cast<DWORD>(body.size()), 0) &&
+                                   isPost ? const_cast<char*>(body.data()) : WINHTTP_NO_REQUEST_DATA, length,
+                                   length, 0) &&
                 WinHttpReceiveResponse(request, nullptr);
     if (!sent) {
         result.error = "Erreur réseau WinHTTP (" + std::to_string(GetLastError()) + ")";
@@ -130,7 +133,7 @@ TradeResult postJson(const std::string& url, const std::string& body, const std:
             result.body.append(chunk.data(), read);
         }
         result.ok = status >= 200 && status < 300;
-        if (!result.ok) result.error = "Ordre refusé par Vyft Trade (HTTP " + std::to_string(status) + ")";
+        if (!result.ok) result.error = "HTTP " + std::to_string(status);
     }
 
     if (request) WinHttpCloseHandle(request);
@@ -144,25 +147,28 @@ size_t appendBody(char* data, size_t size, size_t count, void* target) {
     return size * count;
 }
 
-// POST HTTPS via libcurl (Linux / macOS)
-TradeResult postJson(const std::string& url, const std::string& body, const std::string& apiKey) {
+// Requête HTTP(S) via libcurl (Linux / macOS) ; body ignoré en GET
+TradeResult request(const char* verb, const std::string& url, const std::string& body, const std::string& apiKey) {
     TradeResult result;
     CURL* curl = curl_easy_init();
     if (!curl) {
         result.error = "Initialisation libcurl impossible";
         return result;
     }
+    const bool isPost = std::string(verb) == "POST";
     curl_slist* headers = nullptr;
-    headers = curl_slist_append(headers, "Content-Type: application/json");
+    if (isPost) headers = curl_slist_append(headers, "Content-Type: application/json");
     headers = curl_slist_append(headers, "Accept: application/json");
     std::string keyHeader = "X-API-KEY: " + apiKey;
     if (!apiKey.empty()) headers = curl_slist_append(headers, keyHeader.c_str());
 
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_POST, 1L);
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(body.size()));
+    if (isPost) {
+        curl_easy_setopt(curl, CURLOPT_POST, 1L);
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(body.size()));
+    }
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, appendBody);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &result.body);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
@@ -173,19 +179,33 @@ TradeResult postJson(const std::string& url, const std::string& body, const std:
     } else {
         curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &result.httpStatus);
         result.ok = result.httpStatus >= 200 && result.httpStatus < 300;
-        if (!result.ok) result.error = "Ordre refusé par Vyft Trade (HTTP " + std::to_string(result.httpStatus) + ")";
+        if (!result.ok) result.error = "HTTP " + std::to_string(result.httpStatus);
     }
     curl_slist_free_all(headers);
     curl_easy_cleanup(curl);
     return result;
 }
 #else
-TradeResult postJson(const std::string&, const std::string&, const std::string&) {
+TradeResult request(const char*, const std::string&, const std::string&, const std::string&) {
     TradeResult result;
     result.error = "Aucun client HTTP : compilez avec libcurl (VYFTTRADE_WITH_CURL) hors Windows";
     return result;
 }
 #endif
+
+#ifdef _WIN32
+#define VYFTTRADE_VERB(v) L##v
+#else
+#define VYFTTRADE_VERB(v) v
+#endif
+
+// Envoi d'un ordre : message d'erreur explicite en cas de refus de l'API
+TradeResult postJson(const std::string& url, const std::string& body, const std::string& apiKey) {
+    TradeResult result = request(VYFTTRADE_VERB("POST"), url, body, apiKey);
+    if (!result.ok && result.httpStatus != 0)
+        result.error = "Ordre refusé par Vyft Trade (HTTP " + std::to_string(result.httpStatus) + ")";
+    return result;
+}
 
 }  // namespace
 
@@ -240,18 +260,46 @@ std::optional<std::string> validateOrder(const Order& order) {
     return std::nullopt;
 }
 
-double maxLeverage(double stake, double availableVez) {
+TradeResult httpGet(const std::string& url) { return request(VYFTTRADE_VERB("GET"), url, "", ""); }
+
+TradeResult httpPostJson(const std::string& url, const std::string& body, const std::string& apiKey) {
+    return request(VYFTTRADE_VERB("POST"), url, body, apiKey);
+}
+
+double maxLeverage(double stake, double availableVez, double maxTransferVez) {
     if (!std::isfinite(stake) || stake <= 0 || !std::isfinite(availableVez) || availableVez <= 0) return 0;
-    return std::floor(availableVez / (stake * kGainCapMove));
+    // Le versement net d'une position ne peut dépasser ni l'offre disponible, ni le plafond du contrat
+    double payoutLimit = availableVez;
+    if (std::isfinite(maxTransferVez) && maxTransferVez > 0) payoutLimit = std::min(payoutLimit, maxTransferVez);
+    return std::floor(payoutLimit / maxPayout(stake, 1.0));
 }
 
 double maxGain(double stake, double leverage) { return stake * leverage * kGainCapMove; }
+
+double maxPayout(double stake, double leverage) { return maxGain(stake, leverage) * (1.0 - kProfitFeeMin); }
+
+double profitFeeRate(double health, double utilization) {
+    auto clamp01 = [](double v) { return std::isfinite(v) ? std::clamp(v, 0.0, 1.0) : 1.0; };
+    const double stress = std::max(1.0 - clamp01(health), clamp01(utilization));
+    return kProfitFeeMin + (kProfitFeeMax - kProfitFeeMin) * stress;
+}
+
+ProfitSplit splitProfit(double gross, double feeRate) {
+    const double unit = std::pow(10.0, kVezDecimals);
+    ProfitSplit split;
+    split.gross = std::isfinite(gross) && gross > 0 ? std::floor(gross * unit) / unit : 0;
+    split.feeRate = std::clamp(std::isfinite(feeRate) ? feeRate : kProfitFeeMax, kProfitFeeMin, kProfitFeeMax);
+    // Le net est arrondi vers le bas : l'arrondi profite au pool
+    split.net = std::floor(split.gross * (1.0 - split.feeRate) * unit) / unit;
+    split.fee = std::round((split.gross - split.net) * unit) / unit;
+    return split;
+}
 
 double autoStopLoss(TradeType side, double entryPrice, double leverage) {
     return side == TradeType::Buy ? entryPrice * (1.0 - 1.0 / leverage) : entryPrice * (1.0 + 1.0 / leverage);
 }
 
-std::optional<std::string> validatePosition(const Position& p, double availableVez) {
+std::optional<std::string> validatePosition(const Position& p, double availableVez, double maxTransferVez) {
     if (!std::isfinite(p.stake) || p.stake <= 0) return std::string("Mise invalide");
     if (!std::isfinite(p.entryPrice) || p.entryPrice <= 0) return std::string("Prix VEZ indisponible");
     if (!std::isfinite(p.leverage) || p.leverage < 1) return std::string("Levier invalide (1 minimum)");
@@ -259,8 +307,8 @@ std::optional<std::string> validatePosition(const Position& p, double availableV
         return std::string("Le stop loss d'une position à la hausse doit être sous le prix d'entrée");
     if (p.side == TradeType::Sell && !(p.stopLoss > p.entryPrice))
         return std::string("Le stop loss d'une position à la baisse doit être au-dessus du prix d'entrée");
-    const double limit = maxLeverage(p.stake, availableVez);
-    if (limit < 1) return std::string("Offre émissible insuffisante (preuve de réserves) pour couvrir cette mise");
+    const double limit = maxLeverage(p.stake, availableVez, maxTransferVez);
+    if (limit < 1) return std::string("Offre du pool insuffisante pour couvrir cette mise");
     if (p.leverage > limit) return "Levier maximum pour cette mise : x" + formatDecimal(limit, 0);
     return std::nullopt;
 }

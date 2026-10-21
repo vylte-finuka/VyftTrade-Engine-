@@ -2,20 +2,32 @@
 //
 //   POST /api/v1/trade                         execute_order : ouvre une position (mise, levier, stop loss)
 //                                              cancel_order  : clôt la position orderid au prix courant
-//   GET  /api/v1/trade/quote?wallet=0x…&stake=N prix, offre disponible, levier maximum proposé
+//   POST /api/v1/trade/payout                  {orderid, wallet, txhash} : déclare le versement du gain
+//                                              (redeemvez envoyé par l'app avec le SDK), vérifié sur Slura
+//   GET  /api/v1/trade/quote?wallet=0x…&stake=N prix, offre du pool, frais actuels, levier proposé
 //   GET  /api/v1/trade/orders?wallet=0x…       positions d'un sous-wallet VEZ (plus récentes en premier)
 //   GET  /api/v1/trade/orders/<orderid>        une position
 //   GET  /health                               état du service
 //
 // Lancement : VyftTradeServer [port=8080] [fichier=orders.json]
 //   VYFTTRADE_API_KEY       facultatif : exige l'en-tête X-API-KEY sur /api
-//   VYFTTRADE_SETTLER_URL   service de règlement (défaut http://127.0.0.1:8090)
-//   SETTLER_TOKEN           facultatif : jeton partagé avec le service de règlement
 //   VYFTTRADE_POLL_SECONDS  intervalle de surveillance des stop loss (défaut 15)
+//   VYFTTRADE_POOL_SEED     VEZ du pool VyftHealth alloués au trading par Vyft (défaut 0 : trading fermé)
+//   VYFTTRADE_POOL_ADDRESS  contrat VyftHealth (défaut 0xF7c28aBEdF73761F428a1D209a0290D8baEd2dCC)
+//   VYFT_RPC_URL            RPC Slura (défaut https://slu-charene.vyft-one.com)
+//   POR_URL                 preuve de réserves (défaut https://por.vyft-one.com/api/mint)
 // Le TLS est assuré par le proxy frontal (vyft-trade.vyft-one.com → ce service en HTTP).
 //
 // Règles (voir VyftTrade_motor.h) : la mise reste sur le wallet du client ; au stop loss la position
-// est fermée sans perte ni gain ; un gain est émis en VEZ sur l'offre totale (POST /api/mint de la preuve de réserves).
+// est fermée sans perte ni gain ; un gain est versé depuis le pool VyftHealth, diminué de frais
+// dynamiques qui restent dans le pool. Le serveur ne détient aucune clé : il calcule le montant net
+// (statut « payout_due »), l'app le verse avec le SDK vyfttxl_mate (redeemvez), puis déclare la
+// transaction, que le serveur vérifie (événement vezRedeemed vers le bon wallet, montant suffisant).
+//
+// Liquidité de trading : compte séparé du solde du pool (qui contient aussi les récompenses de pas).
+//   liquidité = VYFTTRADE_POOL_SEED − gains nets dus ou versés ; les positions ouvertes y réservent
+//   leur versement net maximum. Le trading ne peut jamais engager plus que cette liquidité, ni plus que
+//   le solde réel du pool : les récompenses de pas ne servent jamais à payer un trader.
 
 #include "VyftTrade_motor.h"
 
@@ -105,9 +117,24 @@ std::string field(const json& object, const char* key) {
     return {};
 }
 
-bool isWallet(const std::string& w) {
-    return w.size() == 42 && w.rfind("0x", 0) == 0 &&
-           std::all_of(w.begin() + 2, w.end(), [](unsigned char c) { return std::isxdigit(c) != 0; });
+bool isHex(const std::string& s, size_t digits) {
+    return s.size() == digits + 2 && s.rfind("0x", 0) == 0 &&
+           std::all_of(s.begin() + 2, s.end(), [](unsigned char c) { return std::isxdigit(c) != 0; });
+}
+
+bool isWallet(const std::string& w) { return isHex(w, 40); }
+bool isTxHash(const std::string& h) { return isHex(h, 64); }
+
+// Mot ABI (uint256 en hexadécimal) → nombre ; précision suffisante pour des montants VEZ
+long double hexToNumber(const std::string& hex) {
+    long double value = 0;
+    for (size_t i = hex.rfind("0x", 0) == 0 ? 2 : 0; i < hex.size(); ++i) {
+        const int c = std::tolower(static_cast<unsigned char>(hex[i]));
+        const int d = std::isdigit(c) ? c - '0' : (c >= 'a' && c <= 'f') ? c - 'a' + 10 : -1;
+        if (d < 0) break;
+        value = value * 16 + d;
+    }
+    return value;
 }
 
 vyfttrade::Position toPosition(const json& p) {
@@ -120,77 +147,163 @@ vyfttrade::Position toPosition(const json& p) {
     return pos;
 }
 
-// ── Service de règlement (émission via la preuve de réserves VEzcustody) ──
-class Settler {
+// ── Lectures sur Slura et la preuve de réserves (aucune clé, lecture seule) ──
+// Sélecteurs : keccak256(signature)[0:4] ; événement vezRedeemed(address,uint256,address,bytes32)
+constexpr const char* kSelVezToken = "0x07eb54a9";          // vezToken()
+constexpr const char* kSelDecimals = "0x313ce567";          // decimals()
+constexpr const char* kSelSoldeVyftHealth = "0x48e6f7f0";   // soldeVyftHealth()
+constexpr const char* kSelMaxTransfer = "0xfc1b3113";       // MAX_TRANSFER_AMOUNT()
+constexpr const char* kSelEarnRatio = "0x314465d2";         // earnRatio()
+constexpr const char* kSelWalletBalance = "0x329a27e7";     // getWalletBalance() du sous-wallet VEZ
+constexpr const char* kTopicVezRedeemed = "0x8c7c3a79ccdd78795909c9ee121301223db0f4025354bb7f4c6396f99a47b249";
+
+struct PoolInfo {
+    double balance = 0;       // VEZ du pool
+    double maxTransfer = 0;   // plafond d'un versement (VEZ)
+    double earnRatio = 1;     // VEZ versés = valeur demandée × earnRatio
+    int decimals = 18;        // décimales du jeton VEZ
+};
+
+enum class PayoutCheck { Valid, Pending, Invalid };
+
+class Chain {
 public:
-    Settler(std::string url, std::string token) : url_(std::move(url)), token_(std::move(token)) {}
+    Chain(std::string rpcUrl, std::string porUrl, std::string pool)
+        : rpcUrl_(std::move(rpcUrl)), porUrl_(std::move(porUrl)), pool_(lower(std::move(pool))) {}
 
+    const std::string& pool() const { return pool_; }
+
+    // Prix d'1 VEZ en EUR : réserve EUR ÷ offre (ou prix direct s'il est publié)
     std::optional<double> price() {
-        auto body = get("/price");
-        return body ? std::optional<double>(number(*body, "price")) : std::nullopt;
-    }
-
-    // VEZ encore émissibles (availableToMint de la preuve de réserves ; nullopt si injoignable)
-    std::optional<double> mintable() {
-        auto body = get("/mintable");
-        return body ? std::optional<double>(number(*body, "balance")) : std::nullopt;
-    }
-
-    std::optional<double> balance(const std::string& wallet) {
-        auto body = get("/balance?wallet=" + wallet);
-        return body ? std::optional<double>(number(*body, "balance")) : std::nullopt;
-    }
-
-    // Versement idempotent (ref = orderid) : code HTTP du service et sa réponse
-    std::pair<int, json> payout(const std::string& ref, const std::string& to, const std::string& amount) {
-        const json request = {{"ref", ref}, {"to", to}, {"amount", amount}};
-        auto client = makeClient(150);   // un versement attend sa confirmation sur la chaîne
-        auto res = client.Post("/payout", headers(), request.dump(), "application/json");
-        if (!res) return {0, {{"error", "Service de règlement injoignable"}}};
+        const auto res = vyfttrade::httpGet(porUrl_);
+        if (!res.ok) return std::nullopt;
         try {
-            return {res->status, json::parse(res->body)};
+            const json data = json::parse(res.body);
+            const double direct = number(data, "priceEUR", number(data, "price"));
+            const double reserve = number(data, "reserveEUR");
+            const double supply = number(data, "totalSupply");
+            const double value = direct > 0 ? direct : (reserve > 0 && supply > 0 ? reserve / supply : 0);
+            if (value > 0 && std::isfinite(value)) return value;
         } catch (...) {
-            return {res->status, {{"error", res->body}}};
         }
+        return std::nullopt;
+    }
+
+    // Réglages et solde du pool VyftHealth, lus sur la chaîne (décimales du jeton comprises)
+    std::optional<PoolInfo> poolInfo() {
+        const int dec = decimals();
+        auto balance = call(pool_, kSelSoldeVyftHealth);
+        auto maxTransfer = call(pool_, kSelMaxTransfer);
+        auto ratio = call(pool_, kSelEarnRatio);
+        if (!balance || !maxTransfer || !ratio) return std::nullopt;
+        PoolInfo info;
+        info.decimals = dec;
+        const long double unit = std::pow(10.0L, dec);
+        info.balance = static_cast<double>(hexToNumber(*balance) / unit);
+        info.maxTransfer = static_cast<double>(hexToNumber(*maxTransfer) / unit);
+        info.earnRatio = static_cast<double>(hexToNumber(*ratio) / 1e6L);
+        return info;
+    }
+
+    // Solde VEZ d'un sous-wallet (getWalletBalance, comme l'app)
+    std::optional<double> walletBalance(const std::string& wallet) {
+        auto value = call(wallet, kSelWalletBalance);
+        if (!value) return std::nullopt;
+        return static_cast<double>(hexToNumber(*value) / std::pow(10.0L, decimals()));
+    }
+
+    // Vérifie qu'une transaction a versé au moins `minVez` VEZ du pool vers `to` (événement vezRedeemed)
+    PayoutCheck verifyRedeem(const std::string& txHash, const std::string& to, double minVez, std::string& error) {
+        auto receipt = rpc("eth_getTransactionReceipt", json::array({txHash}));
+        if (!receipt) {
+            error = "RPC Slura injoignable";
+            return PayoutCheck::Pending;
+        }
+        if (receipt->is_null()) {
+            error = "Transaction pas encore incluse dans un bloc";
+            return PayoutCheck::Pending;
+        }
+        if (receipt->value("status", "") != "0x1") {
+            error = "Transaction revertée";
+            return PayoutCheck::Invalid;
+        }
+        const std::string topicTo = "0x000000000000000000000000" + lower(to).substr(2);
+        const long double unit = std::pow(10.0L, decimals());
+        for (const auto& log : receipt->value("logs", json::array())) {
+            const json topics = log.value("topics", json::array());
+            if (lower(log.value("address", "")) != pool_ || topics.size() < 2) continue;
+            if (!topics[0].is_string() || !topics[1].is_string()) continue;
+            if (lower(topics[0].get<std::string>()) != kTopicVezRedeemed) continue;
+            if (lower(topics[1].get<std::string>()) != topicTo) continue;
+            const std::string data = log.value("data", "");
+            const long double paid = hexToNumber(data.substr(0, std::min<size_t>(data.size(), 66))) / unit;
+            // Tolérance d'une unité VEZ (6 décimales) pour l'arrondi de earnRatio
+            if (paid + 1e-6L >= static_cast<long double>(minVez)) return PayoutCheck::Valid;
+            error = "Montant versé insuffisant";
+            return PayoutCheck::Invalid;
+        }
+        error = "Aucun versement vezRedeemed du pool vers ce wallet dans cette transaction";
+        return PayoutCheck::Invalid;
     }
 
 private:
-    httplib::Headers headers() const {
-        return token_.empty() ? httplib::Headers{} : httplib::Headers{{"X-SETTLER-TOKEN", token_}};
-    }
-
-    // Un client par appel : un versement long ne bloque ni les prix ni les devis
-    httplib::Client makeClient(int readTimeoutSeconds) const {
-        httplib::Client client(url_);
-        client.set_connection_timeout(5);
-        client.set_read_timeout(readTimeoutSeconds);
-        return client;
-    }
-
-    std::optional<json> get(const std::string& path) {
-        auto client = makeClient(30);
-        auto res = client.Get(path, headers());
-        if (!res || res->status != 200) return std::nullopt;
+    std::optional<json> rpc(const std::string& method, const json& params) {
+        const json request = {{"jsonrpc", "2.0"}, {"id", 1}, {"method", method}, {"params", params}};
+        const auto res = vyfttrade::httpPostJson(rpcUrl_, request.dump());
+        if (!res.ok) return std::nullopt;
         try {
-            return json::parse(res->body);
+            const json body = json::parse(res.body);
+            if (body.contains("error") || !body.contains("result")) return std::nullopt;
+            return body.at("result");
         } catch (...) {
             return std::nullopt;
         }
     }
 
-    std::string url_;
-    std::string token_;
+    std::optional<std::string> call(const std::string& to, const char* data) {
+        const json callObject = {{"to", to}, {"data", data}};
+        auto result = rpc("eth_call", json::array({callObject, "latest"}));
+        if (!result || !result->is_string()) return std::nullopt;
+        const std::string hex = result->get<std::string>();
+        if (hex.size() < 3) return std::nullopt;
+        return hex;
+    }
+
+    // Décimales du jeton VEZ du pool (lues une fois, 18 à défaut)
+    int decimals() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (decimals_ > 0) return decimals_;
+        if (auto token = call(pool_, kSelVezToken); token && token->size() >= 42) {
+            if (auto dec = call("0x" + token->substr(token->size() - 40), kSelDecimals)) {
+                const int value = static_cast<int>(hexToNumber(*dec));
+                if (value > 0 && value <= 36) return decimals_ = value;
+            }
+        }
+        return 18;
+    }
+
+    std::string rpcUrl_;
+    std::string porUrl_;
+    std::string pool_;
+    int decimals_ = 0;
+    std::mutex mutex_;
 };
 
-// Statuts qui gardent un gain réservé sur l'offre émissible
-bool reservesGain(const std::string& status) {
-    return status == "open" || status == "closing" || status == "payout_pending" || status == "payout_review";
-}
+// Versement net maximum réservé par une position (anciennes positions : gain brut maximum)
+double reservedPayout(const json& p) { return number(p, "maxpayout", number(p, "maxgain")); }
+
+// État de la liquidité de trading
+struct PoolState {
+    double seed = 0;        // VEZ alloués au trading
+    double spent = 0;       // gains nets dus ou versés
+    double liquidity = 0;   // seed − spent
+    double reserved = 0;    // versements nets maximum des positions ouvertes
+};
 
 // ── Positions persistantes (fichier JSON réécrit à chaque modification) ──
 class PositionStore {
 public:
-    explicit PositionStore(std::filesystem::path file) : file_(std::move(file)) {
+    PositionStore(std::filesystem::path file, double seed) : file_(std::move(file)), seed_(seed) {
         std::ifstream in(file_);
         if (in) {
             try {
@@ -200,14 +313,32 @@ public:
             }
         }
         if (!items_.is_array()) items_ = json::array();
-        // Clôture interrompue par un arrêt : on la reprend au prochain passage de la surveillance
+        // Clôture interrompue par un arrêt : chiffrée → versement dû ; pas encore chiffrée → rouverte
         for (auto& p : items_)
-            if (p.value("status", "") == "closing") p["status"] = "payout_pending";
+            if (p.value("status", "") == "closing") p["status"] = p.contains("payout") ? "payout_due" : "open";
     }
 
-    double reserved() {
+    PoolState pool() {
         std::lock_guard<std::mutex> lock(mutex_);
-        return reservedLocked();
+        return poolLocked();
+    }
+
+    // Offre encore engageable : bornée par le compte de trading et par le solde réel du pool
+    double available(double poolBalance) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return availableLocked(poolBalance);
+    }
+
+    // Taux de frais actuel ; `excludeId` retire la réservation de la position qui se clôt
+    double feeRate(const std::string& excludeId = "") {
+        std::lock_guard<std::mutex> lock(mutex_);
+        PoolState s = poolLocked();
+        if (!excludeId.empty())
+            for (const auto& p : items_)
+                if (p.value("orderid", "") == excludeId && reservesOpen(p)) s.reserved -= reservedPayout(p);
+        const double health = s.seed > 0 ? s.liquidity / s.seed : 0;
+        const double utilization = s.liquidity > 0 ? std::max(0.0, s.reserved) / s.liquidity : 1;
+        return vyfttrade::profitFeeRate(health, utilization);
     }
 
     double openStake(const std::string& wallet) {
@@ -215,12 +346,13 @@ public:
         return openStakeLocked(wallet);
     }
 
-    // Ouvre la position si l'offre émissible et le solde du client la couvrent encore (vérifié sous verrou)
-    std::pair<int, json> open(json position, double mintable, double walletBalance) {
+    // Ouvre la position si l'offre du pool et le solde du client la couvrent encore (sous verrou)
+    std::pair<int, json> open(json position, const PoolInfo& info, double walletBalance) {
         std::lock_guard<std::mutex> lock(mutex_);
         const vyfttrade::Position pos = toPosition(position);
-        const double available = std::max(0.0, mintable - reservedLocked());
-        if (auto error = vyfttrade::validatePosition(pos, available)) return {422, {{"error", *error}}};
+        const double available = availableLocked(info.balance);
+        if (auto error = vyfttrade::validatePosition(pos, available, info.maxTransfer))
+            return {422, {{"error", *error}}};
         const std::string wallet = position.value("wallet", "");
         if (openStakeLocked(wallet) + pos.stake > walletBalance + 1e-9)
             return {422, {{"error", "Solde VEZ insuffisant pour cette mise (positions ouvertes comprises)"}}};
@@ -268,6 +400,28 @@ public:
         return {404, {{"error", "Position introuvable"}}};
     }
 
+    // Réserve une transaction de versement pour une position due (un hash ne sert qu'une fois)
+    std::pair<int, json> claimPayout(const std::string& orderId, const std::string& wallet, const std::string& txHash) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto& p : items_)
+            if (lower(p.value("txhash", "")) == lower(txHash) && p.value("orderid", "") != orderId)
+                return {409, {{"error", "Cette transaction a déjà servi à une autre position"}}};
+        for (auto& p : items_) {
+            if (p.value("orderid", "") != orderId) continue;
+            if (lower(p.value("wallet", "")) != lower(wallet))
+                return {403, {{"error", "Cette position n'appartient pas à ce sous-wallet"}}};
+            if (p.value("status", "") == "closed") return {200, p};
+            if (p.value("status", "") != "payout_due")
+                return {409, {{"error", "Aucun versement dû pour cette position (" + p.value("status", "") + ")"}}};
+            // Hash réservé dès maintenant : une déclaration simultanée ne peut pas le réutiliser
+            p["txhash"] = lower(txHash);
+            p["updated_at"] = nowIso();
+            save();
+            return {202, p};
+        }
+        return {404, {{"error", "Position introuvable"}}};
+    }
+
     json update(const std::string& orderId, const std::function<void(json&)>& change) {
         std::lock_guard<std::mutex> lock(mutex_);
         for (auto& p : items_) {
@@ -281,11 +435,26 @@ public:
     }
 
 private:
-    double reservedLocked() const {
-        double total = 0;
-        for (const auto& p : items_)
-            if (reservesGain(p.value("status", ""))) total += number(p, "maxgain");
-        return total;
+    // Position qui réserve encore son versement maximum (ouverte, ou clôture pas encore chiffrée)
+    static bool reservesOpen(const json& p) {
+        const std::string status = p.value("status", "");
+        return status == "open" || (status == "closing" && !p.contains("payout"));
+    }
+
+    PoolState poolLocked() const {
+        PoolState s;
+        s.seed = seed_;
+        for (const auto& p : items_) {
+            if (reservesOpen(p)) s.reserved += reservedPayout(p);
+            else s.spent += number(p, "payout");   // dû (payout_due) ou versé (closed)
+        }
+        s.liquidity = s.seed - s.spent;
+        return s;
+    }
+
+    double availableLocked(double poolBalance) const {
+        const PoolState s = poolLocked();
+        return std::max(0.0, std::min(s.liquidity, poolBalance) - s.reserved);
     }
 
     double openStakeLocked(const std::string& wallet) const {
@@ -306,50 +475,32 @@ private:
     }
 
     std::filesystem::path file_;
+    double seed_ = 0;
     json items_ = json::array();
     std::mutex mutex_;
 };
 
-// Verse le résultat d'une position en « closing » (ou relance un versement en attente)
-json settle(PositionStore& store, Settler& settler, const json& position) {
+// Clôture : gain brut au prix courant, frais dynamiques (restent dans le pool), net dû au client
+json closePosition(PositionStore& store, json position, double price, vyfttrade::CloseReason reason) {
     const std::string id = position.value("orderid", "");
-    const double amount = number(position, "payout");
-    if (amount <= 0) {
-        // Stop loss ou position sans gain : rien n'est perdu ni versé
-        return store.update(id, [](json& p) {
-            p["status"] = "closed";
-            p["result"] = "nul";
-        });
-    }
-    auto [status, body] = settler.payout(id, position.value("wallet", ""), position.value("payout", "0"));
-    return store.update(id, [&, status = status, body = body](json& p) {
-        if (status == 200) {
-            p["status"] = "closed";
-            p["result"] = "gain";
-            p["txhash"] = body.value("txHash", "");
-            p.erase("error");
-        } else if (status == 409) {
-            p["status"] = "payout_review";   // état incertain : aucun nouveau versement automatique
-            p["error"] = body.value("error", "Versement à vérifier");
-        } else {
-            p["status"] = "payout_pending";  // relancé par la surveillance (même ref, jamais payé deux fois)
-            p["error"] = body.value("error", "Versement en attente");
-        }
-    });
-}
-
-// Clôture : calcule le versement au prix courant, puis règle
-json closePosition(PositionStore& store, Settler& settler, json position, double price,
-                   vyfttrade::CloseReason reason) {
     const vyfttrade::Position pos = toPosition(position);
-    const double amount = vyfttrade::settlementAmount(pos, price, reason);
-    position = store.update(position.value("orderid", ""), [&](json& p) {
+    const double gross = vyfttrade::settlementAmount(pos, price, reason);
+    const vyfttrade::ProfitSplit split = vyfttrade::splitProfit(gross, gross > 0 ? store.feeRate(id) : 0);
+    return store.update(id, [&](json& p) {
         p["closeprice"] = decimal(price);
         p["closereason"] = vyfttrade::toString(reason);
         p["closed_at"] = nowIso();
-        p["payout"] = vyfttrade::formatQuantity(amount);
+        p["gross"] = vyfttrade::formatQuantity(split.gross);
+        p["feerate"] = decimal(split.feeRate, 4);
+        p["fee"] = vyfttrade::formatQuantity(split.fee);
+        p["payout"] = vyfttrade::formatQuantity(split.net);
+        if (split.net > 0) {
+            p["status"] = "payout_due";   // l'app verse le net avec le SDK, puis le déclare
+        } else {
+            p["status"] = "closed";       // stop loss ou position sans gain : rien n'est perdu ni versé
+            p["result"] = "nul";
+        }
     });
-    return settle(store, settler, position);
 }
 
 void reply(httplib::Response& res, int status, const json& body) {
@@ -369,8 +520,11 @@ int main(int argc, char** argv) {
     const std::string apiKey = envOr("VYFTTRADE_API_KEY", "");
     const int pollSeconds = std::max(5, std::atoi(envOr("VYFTTRADE_POLL_SECONDS", "15").c_str()));
 
-    PositionStore store(dataFile);
-    Settler settler(envOr("VYFTTRADE_SETTLER_URL", "http://127.0.0.1:8090"), envOr("SETTLER_TOKEN", ""));
+    const double poolSeed = std::max(0.0, std::strtod(envOr("VYFTTRADE_POOL_SEED", "0").c_str(), nullptr));
+    PositionStore store(dataFile, std::isfinite(poolSeed) ? poolSeed : 0);
+    Chain chain(envOr("VYFT_RPC_URL", "https://slu-charene.vyft-one.com"),
+                envOr("POR_URL", "https://por.vyft-one.com/api/mint"),
+                envOr("VYFTTRADE_POOL_ADDRESS", "0xF7c28aBEdF73761F428a1D209a0290D8baEd2dCC"));
     httplib::Server server;
 
     // Clé d'API (si configurée) sur toutes les routes /api
@@ -386,30 +540,38 @@ int main(int argc, char** argv) {
         reply(res, 200, {{"status", "ok"}, {"asset", vyfttrade::kVezAsset}, {"chain", vyfttrade::kVezChain}});
     });
 
-    // Prix, offre disponible et levier maximum proposé pour une mise
+    // Prix, offre du pool, frais actuels et levier maximum proposé pour une mise
     server.Get("/api/v1/trade/quote", [&](const httplib::Request& req, httplib::Response& res) {
         const std::string wallet = req.get_param_value("wallet");
         const double stake = std::strtod(req.get_param_value("stake").c_str(), nullptr);
-        auto price = settler.price();
-        if (!price || *price <= 0) {
-            reply(res, 503, {{"error", "Prix VEZ indisponible"}});
+        auto price = chain.price();
+        if (!price) {
+            reply(res, 503, {{"error", "Prix VEZ indisponible (preuve de réserves)"}});
             return;
         }
-        const double mintable = settler.mintable().value_or(0);
-        const double reserved = store.reserved();
-        const double available = std::max(0.0, mintable - reserved);
-        const double maxLev = vyfttrade::maxLeverage(stake, available);
+        const PoolInfo info = chain.poolInfo().value_or(PoolInfo{});
+        const PoolState pool = store.pool();
+        const double available = store.available(info.balance);
+        const double maxLev = vyfttrade::maxLeverage(stake, available, info.maxTransfer);
         json quote = {
             {"price", decimal(*price)},
-            {"mintable", vyfttrade::formatQuantity(mintable)},
-            {"reserved", vyfttrade::formatQuantity(reserved)},
+            {"pool", chain.pool()},
+            {"poolbalance", vyfttrade::formatQuantity(info.balance)},
+            {"maxtransfer", decimal(info.maxTransfer, 18)},
+            {"earnratio", decimal(info.earnRatio, 6)},
+            {"decimals", info.decimals},
+            {"liquidity", vyfttrade::formatQuantity(pool.liquidity)},
+            {"reserved", vyfttrade::formatQuantity(pool.reserved)},
             {"available", vyfttrade::formatQuantity(available)},
+            {"feerate", decimal(store.feeRate(), 4)},
+            {"feemin", decimal(vyfttrade::kProfitFeeMin, 4)},
+            {"feemax", decimal(vyfttrade::kProfitFeeMax, 4)},
             {"gaincapmove", decimal(vyfttrade::kGainCapMove, 4)},
             {"maxleverage", decimal(maxLev, 0)},
             {"suggestedleverage", decimal(maxLev, 0)},
         };
         if (isWallet(wallet)) {
-            quote["balance"] = vyfttrade::formatQuantity(settler.balance(wallet).value_or(0));
+            quote["balance"] = vyfttrade::formatQuantity(chain.walletBalance(wallet).value_or(0));
             quote["openstake"] = vyfttrade::formatQuantity(store.openStake(wallet));
         }
         reply(res, 200, quote);
@@ -450,9 +612,9 @@ int main(int argc, char** argv) {
             return;
         }
 
-        auto price = settler.price();
-        if (!price || *price <= 0) {
-            reply(res, 503, {{"error", "Prix VEZ indisponible (service de règlement)"}});
+        auto price = chain.price();
+        if (!price) {
+            reply(res, 503, {{"error", "Prix VEZ indisponible (preuve de réserves)"}});
             return;
         }
 
@@ -462,14 +624,14 @@ int main(int argc, char** argv) {
                 reply(res, status, position);
                 return;
             }
-            reply(res, 200, closePosition(store, settler, position, *price, vyfttrade::CloseReason::None));
+            reply(res, 200, closePosition(store, position, *price, vyfttrade::CloseReason::None));
             return;
         }
 
-        auto balance = settler.balance(order.action.wallet);
-        auto mintable = settler.mintable();
-        if (!balance || !mintable) {
-            reply(res, 503, {{"error", "Solde ou offre émissible indisponible (service de règlement)"}});
+        auto balance = chain.walletBalance(order.action.wallet);
+        auto info = chain.poolInfo();
+        if (!balance || !info) {
+            reply(res, 503, {{"error", "Solde du wallet ou du pool indisponible (RPC Slura)"}});
             return;
         }
 
@@ -494,13 +656,56 @@ int main(int argc, char** argv) {
             {"stoploss", decimal(pos.stopLoss)},
             {"takeprofit", decimal(takeProfit)},
             {"maxgain", vyfttrade::formatQuantity(vyfttrade::maxGain(pos.stake, pos.leverage))},
+            {"maxpayout", vyfttrade::formatQuantity(vyfttrade::maxPayout(pos.stake, pos.leverage))},
             {"currency", order.action.currency},
             {"wallet", order.action.wallet},
             {"created_at", nowIso()},
             {"updated_at", nowIso()},
         };
-        auto [status, result] = store.open(position, *mintable, *balance);
+        auto [status, result] = store.open(position, *info, *balance);
         reply(res, status, result);
+    });
+
+    // Déclaration du versement d'un gain (redeemvez envoyé par l'app), vérifié sur la chaîne
+    server.Post("/api/v1/trade/payout", [&](const httplib::Request& req, httplib::Response& res) {
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (...) {
+            reply(res, 400, {{"error", "Corps JSON invalide"}});
+            return;
+        }
+        const std::string orderId = field(body, "orderid");
+        const std::string wallet = field(body, "wallet");
+        const std::string txHash = lower(field(body, "txhash"));
+        if (orderId.empty() || !isWallet(wallet) || !isTxHash(txHash)) {
+            reply(res, 400, {{"error", "orderid, wallet (0x…) et txhash (0x + 64 caractères) requis"}});
+            return;
+        }
+        auto [status, position] = store.claimPayout(orderId, wallet, txHash);
+        if (status != 202) {
+            reply(res, status, position);
+            return;
+        }
+        std::string error;
+        switch (chain.verifyRedeem(txHash, wallet, number(position, "payout"), error)) {
+            case PayoutCheck::Valid:
+                reply(res, 200, store.update(orderId, [&](json& p) {
+                    p["status"] = "closed";
+                    p["result"] = "gain";
+                    p["txhash"] = txHash;
+                    p["paid_at"] = nowIso();
+                    p.erase("error");
+                }));
+                return;
+            case PayoutCheck::Pending:
+                reply(res, 202, {{"orderid", orderId}, {"status", "payout_due"}, {"error", error}});
+                return;
+            case PayoutCheck::Invalid:
+                store.update(orderId, [](json& p) { p.erase("txhash"); });   // hash libéré : il ne paie rien ici
+                reply(res, 422, {{"orderid", orderId}, {"status", "payout_due"}, {"error", error}});
+                return;
+        }
     });
 
     server.Get("/api/v1/trade/orders", [&](const httplib::Request& req, httplib::Response& res) {
@@ -517,29 +722,26 @@ int main(int argc, char** argv) {
         else reply(res, 404, {{"error", "Position introuvable"}});
     });
 
-    // Surveillance : stop loss, plafond de gain, versements en attente
+    // Surveillance : stop loss et gain maximum atteints
     std::atomic<bool> running{true};
     std::thread monitor([&] {
         while (running) {
-            if (auto price = settler.price(); price && *price > 0) {
+            if (auto price = chain.price()) {
                 for (const auto& id : store.idsWithStatus("open")) {
                     auto position = store.find(id);
                     if (!position) continue;
                     const auto reason = vyfttrade::checkClose(toPosition(*position), *price);
                     if (reason == vyfttrade::CloseReason::None) continue;
                     auto [status, closing] = store.beginClose(id, "", "open");
-                    if (status == 200) closePosition(store, settler, closing, *price, reason);
+                    if (status == 200) closePosition(store, closing, *price, reason);
                 }
-            }
-            for (const auto& id : store.idsWithStatus("payout_pending")) {
-                auto [status, closing] = store.beginClose(id, "", "payout_pending");
-                if (status == 200) settle(store, settler, closing);
             }
             for (int i = 0; i < pollSeconds && running; ++i) std::this_thread::sleep_for(std::chrono::seconds(1));
         }
     });
 
-    std::cout << "Vyft Trade API sur le port " << port << " (positions : " << dataFile.string() << ")" << std::endl;
+    std::cout << "Vyft Trade API sur le port " << port << " (positions : " << dataFile.string() << ", pool "
+              << chain.pool() << ")" << std::endl;
     const bool listened = server.listen("0.0.0.0", port);
     running = false;
     monitor.join();

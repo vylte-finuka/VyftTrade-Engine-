@@ -52,16 +52,42 @@ Sous Windows l'envoi passe par WinHTTP ; ailleurs par libcurl. L'interface C `Tr
 
 | Route | Rôle |
 |---|---|
-| `POST /api/v1/trade` | `execute_order` → ordre enregistré `pending` (201) ; `cancel_order` → `cancelled` (200) |
-| `GET /api/v1/trade/orders?wallet=0x…` | ordres d'un sous-wallet VEZ |
-| `GET /api/v1/trade/orders/<orderid>` | un ordre |
+| `POST /api/v1/trade` | `execute_order` → ouvre une position (201) ; `cancel_order` → la clôt au prix courant (200) |
+| `POST /api/v1/trade/payout` | `{orderid, wallet, txhash}` : déclare le versement du gain, vérifié sur Slura |
+| `GET /api/v1/trade/quote?wallet=0x…&stake=N` | prix, offre du pool, frais actuels, levier maximum proposé |
+| `GET /api/v1/trade/orders?wallet=0x…` | positions d'un sous-wallet VEZ |
+| `GET /api/v1/trade/orders/<orderid>` | une position |
 | `GET /health` | état du service |
 
-Erreurs : 400 requête illisible, 401 clé d'API invalide (si `VYFTTRADE_API_KEY` est définie),
-422 ordre refusé par le moteur, 403/404/409 pour une annulation impossible.
+**Positions.** La mise (`quantity`, en VEZ) reste sur le wallet du client. `typetrade` : `buy` à la
+hausse, `sell` à la baisse ; `leverage` et `stoploss` facultatifs (stop automatique sinon).
+- Stop loss : position fermée, **rien n'est perdu ni gagné** (`result: "nul"`).
+- Gain : mise × levier × variation du prix. Ni le gain ni le levier n'ont de plafond fixe : l'offre
+  du pool les limite. Chaque position réserve son gain maximum et se clôt d'elle-même à ce niveau.
+- Frais dynamiques sur le profit (10 % à 90 % selon la tension du pool), qui restent dans le pool.
 
-Le règlement sur Slura (livraison/réception des VEZ, paiement en devise) n'est pas encore branché :
-les ordres restent `pending` (voir `settleOrder()` dans `VyftTrade_server.cpp`).
+**Versement des gains.** Le serveur ne détient aucune clé. À la clôture d'une position gagnante, il
+passe au statut `payout_due` avec le montant net (`payout`). L'app le verse depuis le pool VyftHealth
+avec le SDK `vyfttxl_mate` (`redeemvez`), puis déclare la transaction sur `/api/v1/trade/payout`.
+Le serveur vérifie l'événement `vezRedeemed` (pool, destinataire, montant) avant de passer la position
+à `closed`. Un hash de transaction ne peut servir qu'à une seule position.
+
+**Offre du pool.** Le serveur lit sur Slura le solde du pool, son plafond de versement
+(`MAX_TRANSFER_AMOUNT`), `earnRatio` et les décimales du VEZ. La part réservée au trading est fixée par
+`VYFTTRADE_POOL_SEED` (0 par défaut : trading fermé) ; les récompenses de pas n'y sont jamais prises.
+
+| Variable | Défaut |
+|---|---|
+| `VYFTTRADE_POOL_SEED` | `0` |
+| `VYFTTRADE_POOL_ADDRESS` | `0xF7c28aBEdF73761F428a1D209a0290D8baEd2dCC` |
+| `VYFT_RPC_URL` | `https://slu-charene.vyft-one.com` |
+| `POR_URL` | `https://por.vyft-one.com/api/mint` |
+| `VYFTTRADE_API_KEY` | aucune |
+| `VYFTTRADE_POLL_SECONDS` | `15` |
+
+Erreurs : 400 requête illisible, 401 clé d'API invalide (si `VYFTTRADE_API_KEY` est définie),
+422 ordre ou versement refusé, 403/404/409 pour une clôture ou un versement impossible,
+503 prix, pool ou RPC indisponible.
 
 ## Requête API (format général)
 
