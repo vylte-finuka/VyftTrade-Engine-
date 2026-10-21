@@ -1,5 +1,11 @@
 ﻿# CMakeList.txt : moteur Vyft Trade™ (bibliothèque d'ordres VEZ + exécutable en ligne de commande)
 
+# Compilable seul (Docker, cmake -S .) ou comme sous-projet du CMakeLists.txt parent
+if (CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+  cmake_minimum_required (VERSION 3.14)
+  project ("VyftTradeEngine" CXX)
+endif ()
+
 # Bibliothèque : construction, validation et envoi des ordres (API vyft-trade.vyft-one.com)
 add_library (VyftTradeEngine STATIC "VyftTrade_motor.cpp" "VyftTrade_motor.h")
 target_include_directories (VyftTradeEngine PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")

@@ -1,0 +1,6 @@
+.env
+build/
+out/
+.vs/
+orders.json
+orders.json.tmp

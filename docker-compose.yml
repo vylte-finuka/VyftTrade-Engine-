@@ -1,0 +1,20 @@
+# Vyft Trade™ : serveur API C++ (les versements passent par l'app et le pool VyftHealth)
+# Lancement, dans ce dossier : docker compose up -d --build   (variables dans .env, voir README)
+services:
+  trade:
+    build: .
+    ports:
+      - "127.0.0.1:8080:8080"  # derrière le proxy HTTPS de vyft-trade.vyft-one.com
+    environment:
+      VYFTTRADE_API_KEY: ${VYFTTRADE_API_KEY:-}
+      VYFTTRADE_POLL_SECONDS: ${VYFTTRADE_POLL_SECONDS:-15}
+      VYFTTRADE_POOL_SEED: ${VYFTTRADE_POOL_SEED:-0}
+      VYFTTRADE_POOL_ADDRESS: ${VYFTTRADE_POOL_ADDRESS:-0xF7c28aBEdF73761F428a1D209a0290D8baEd2dCC}
+      VYFT_RPC_URL: ${VYFT_RPC_URL:-https://slu-charene.vyft-one.com}
+      POR_URL: ${POR_URL:-https://por.vyft-one.com/api/mint}
+    volumes:
+      - trade-data:/data
+    restart: unless-stopped
+
+volumes:
+  trade-data:
